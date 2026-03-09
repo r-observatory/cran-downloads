@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS downloads_daily (
   PRIMARY KEY (package, date)
 )")
 
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_dd_date ON downloads_daily(date)")
+
 dbExecute(con, "
 CREATE TABLE IF NOT EXISTS downloads_summary (
   package      TEXT PRIMARY KEY,
@@ -53,6 +55,18 @@ CREATE TABLE IF NOT EXISTS backfill_state (
   key   TEXT PRIMARY KEY,
   value TEXT
 )")
+
+# ---------------------------------------------------------------------------
+# Fetch CRAN package list once (reused by forward fetch and backfill)
+# ---------------------------------------------------------------------------
+cran_packages <- tryCatch({
+  ap <- available.packages(repos = "https://cloud.r-project.org")
+  sort(unique(rownames(ap)))
+}, error = function(e) {
+  cat("Warning: Could not get available.packages:", e$message, "\n")
+  character(0)
+})
+cat("Found", length(cran_packages), "packages on CRAN\n")
 
 # ---------------------------------------------------------------------------
 # Tracking variables for release notes
@@ -194,18 +208,10 @@ tryCatch({
   }
 
   if (start_date <= yesterday) {
-    # Get package list from CRAN
-    cat("  Fetching package list from CRAN...\n")
-    pkgs <- tryCatch({
-      ap <- available.packages(repos = "https://cloud.r-project.org")
-      sort(unique(rownames(ap)))
-    }, error = function(e) {
-      cat("  Warning: Could not get available.packages:", e$message, "\n")
-      character(0)
-    })
+    pkgs <- cran_packages
 
     if (length(pkgs) > 0) {
-      cat("  Found", length(pkgs), "packages on CRAN\n")
+      cat("  Using", length(pkgs), "packages from CRAN\n")
       cat("  Fetching downloads from", format(start_date), "to", format(yesterday), "\n")
 
       result_df <- fetch_downloads(pkgs, start_date, yesterday)
@@ -260,13 +266,7 @@ tryCatch({
     cat("  Backfilling from", format(backfill_start), "to", format(backfill_end), "\n")
 
     # For backfill, use top 5000 packages only (reduce API load)
-    pkgs <- tryCatch({
-      ap <- available.packages(repos = "https://cloud.r-project.org")
-      sort(unique(rownames(ap)))
-    }, error = function(e) {
-      cat("  Warning: Could not get available.packages:", e$message, "\n")
-      character(0)
-    })
+    pkgs <- cran_packages
 
     if (length(pkgs) > 5000) {
       pkgs <- pkgs[seq_len(5000)]
@@ -314,9 +314,8 @@ tryCatch({
   } else {
     cat("  Building summary from", row_count, "daily rows\n")
 
-    dbExecute(con, "DELETE FROM downloads_summary")
-
     dbBegin(con)
+    dbExecute(con, "DELETE FROM downloads_summary")
     dbExecute(con, sprintf("
       INSERT INTO downloads_summary (package, total_30d, total_90d, total_365d,
                                      avg_daily_30d, trend)
@@ -342,28 +341,22 @@ tryCatch({
        format(today), format(today), format(today), format(today),
        format(today), format(today)))
 
-    # Compute ranks using window functions
+    # Compute ranks using window functions (avoids O(n^2) correlated subqueries)
     dbExecute(con, "
-      UPDATE downloads_summary
-      SET rank_30d = (
-        SELECT COUNT(*) + 1 FROM downloads_summary AS s2
-        WHERE s2.total_30d > downloads_summary.total_30d
-      )
+      CREATE TEMP TABLE ranked AS
+      SELECT package,
+        RANK() OVER (ORDER BY total_30d DESC) as r30,
+        RANK() OVER (ORDER BY total_90d DESC) as r90,
+        RANK() OVER (ORDER BY total_365d DESC) as r365
+      FROM downloads_summary
     ")
     dbExecute(con, "
-      UPDATE downloads_summary
-      SET rank_90d = (
-        SELECT COUNT(*) + 1 FROM downloads_summary AS s2
-        WHERE s2.total_90d > downloads_summary.total_90d
-      )
+      UPDATE downloads_summary SET
+        rank_30d = (SELECT r30 FROM ranked WHERE ranked.package = downloads_summary.package),
+        rank_90d = (SELECT r90 FROM ranked WHERE ranked.package = downloads_summary.package),
+        rank_365d = (SELECT r365 FROM ranked WHERE ranked.package = downloads_summary.package)
     ")
-    dbExecute(con, "
-      UPDATE downloads_summary
-      SET rank_365d = (
-        SELECT COUNT(*) + 1 FROM downloads_summary AS s2
-        WHERE s2.total_365d > downloads_summary.total_365d
-      )
-    ")
+    dbExecute(con, "DROP TABLE ranked")
     dbCommit(con)
 
     summary_count <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM downloads_summary")$n
