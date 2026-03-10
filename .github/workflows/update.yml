@@ -33,7 +33,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download latest --pattern "downloads.db"
+        run: gh release download --pattern "downloads.db"
 
       - name: Run update script
         run: Rscript scripts/update.R downloads.db
@@ -49,10 +49,12 @@ jobs:
             --latest
 
       - name: Update last run timestamp
+        continue-on-error: true
         run: |
           echo "Last updated: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > last-updated.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last-updated.txt
           git diff --cached --quiet || git commit -m "chore: update last run time"
+          git pull --rebase || true
           git push
