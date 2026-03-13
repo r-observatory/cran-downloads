@@ -74,6 +74,7 @@ cat("Found", length(cran_packages), "packages on CRAN\n")
 rows_added <- 0L
 forward_rows <- 0L
 backfill_rows <- 0L
+repair_rows <- 0L
 
 # ---------------------------------------------------------------------------
 # Helper: fetch download data from cranlogs API
@@ -265,13 +266,7 @@ tryCatch({
 
     cat("  Backfilling from", format(backfill_start), "to", format(backfill_end), "\n")
 
-    # For backfill, use top 5000 packages only (reduce API load)
     pkgs <- cran_packages
-
-    if (length(pkgs) > 5000) {
-      pkgs <- pkgs[seq_len(5000)]
-      cat("  Limiting backfill to top 5000 packages\n")
-    }
 
     if (length(pkgs) > 0) {
       cat("  Fetching backfill downloads for", length(pkgs), "packages\n")
@@ -301,9 +296,57 @@ tryCatch({
 })
 
 # =========================================================================
-# 3. Rebuild downloads_summary
+# 3. Repair partial-coverage dates
 # =========================================================================
-cat("\n=== 3. Rebuild Summary ===\n")
+# Earlier backfills only fetched 5K packages. Re-fetch dates where coverage
+# is below 20K packages using the full CRAN package list. Process up to
+# 2 weeks per run to stay within workflow time limits.
+cat("\n=== 3. Repair Partial Coverage ===\n")
+tryCatch({
+  # Find dates with fewer than 20K packages (partial backfill)
+  partial <- dbGetQuery(con, "
+    SELECT date, COUNT(DISTINCT package) AS pkg_count
+    FROM downloads_daily
+    GROUP BY date
+    HAVING pkg_count < 20000
+    ORDER BY date DESC
+    LIMIT 14
+  ")
+
+  if (nrow(partial) == 0) {
+    cat("  No partial-coverage dates found — all dates have full coverage\n")
+  } else {
+    cat("  Found", nrow(partial), "dates with partial coverage (of",
+        dbGetQuery(con, "SELECT COUNT(DISTINCT date) AS n FROM downloads_daily HAVING n > 0")$n,
+        "total dates)\n")
+    cat("  Repairing dates:", paste(partial$date, collapse = ", "), "\n")
+
+    pkgs <- cran_packages
+    if (length(pkgs) > 0) {
+      repair_start <- min(as.Date(partial$date))
+      repair_end <- max(as.Date(partial$date))
+      cat("  Fetching", length(pkgs), "packages from",
+          format(repair_start), "to", format(repair_end), "\n")
+
+      result_df <- fetch_downloads(pkgs, repair_start, repair_end)
+      if (nrow(result_df) > 0) {
+        n <- insert_downloads(con, result_df)
+        repair_rows <- n
+        rows_added <- rows_added + n
+        cat("  Inserted/updated", n, "repair rows\n")
+      } else {
+        cat("  No repair data returned from API\n")
+      }
+    }
+  }
+}, error = function(e) {
+  cat("  Repair ERROR:", e$message, "\n")
+})
+
+# =========================================================================
+# 4. Rebuild downloads_summary
+# =========================================================================
+cat("\n=== 4. Rebuild Summary ===\n")
 tryCatch({
   today <- Sys.Date()
 
@@ -368,9 +411,9 @@ tryCatch({
 })
 
 # =========================================================================
-# 4. Release Notes
+# 5. Release Notes
 # =========================================================================
-cat("\n=== 4. Release Notes ===\n")
+cat("\n=== 5. Release Notes ===\n")
 
 total_rows <- tryCatch(
   dbGetQuery(con, "SELECT COUNT(*) AS n FROM downloads_daily")$n,
@@ -407,6 +450,7 @@ notes <- paste0(
   "|--------|-------|\n",
   "| Rows added (forward) | ", forward_rows, " |\n",
   "| Rows added (backfill) | ", backfill_rows, " |\n",
+  "| Rows added (repair) | ", repair_rows, " |\n",
   "| Total rows added | ", rows_added, " |\n",
   "| Total rows in DB | ", total_rows, " |\n",
   "| Date range | ", date_range$min_date, " to ", date_range$max_date, " |\n",
