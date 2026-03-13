@@ -300,7 +300,7 @@ tryCatch({
 # =========================================================================
 # Earlier backfills only fetched 5K packages. Re-fetch dates where coverage
 # is below 20K packages using the full CRAN package list. Process up to
-# 2 weeks per run to stay within workflow time limits.
+# 30 days per run to stay within workflow time limits.
 cat("\n=== 3. Repair Partial Coverage ===\n")
 tryCatch({
   # Find dates with fewer than 20K packages (partial backfill)
@@ -310,7 +310,7 @@ tryCatch({
     GROUP BY date
     HAVING pkg_count < 20000
     ORDER BY date DESC
-    LIMIT 14
+    LIMIT 30
   ")
 
   if (nrow(partial) == 0) {
