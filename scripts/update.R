@@ -316,26 +316,40 @@ tryCatch({
   if (nrow(partial) == 0) {
     cat("  No partial-coverage dates found — all dates have full coverage\n")
   } else {
-    cat("  Found", nrow(partial), "dates with partial coverage (of",
-        dbGetQuery(con, "SELECT COUNT(DISTINCT date) AS n FROM downloads_daily HAVING n > 0")$n,
-        "total dates)\n")
-    cat("  Repairing dates:", paste(partial$date, collapse = ", "), "\n")
+    cat("  Found", nrow(partial), "dates with partial coverage\n")
 
     pkgs <- cran_packages
     if (length(pkgs) > 0) {
-      repair_start <- min(as.Date(partial$date))
-      repair_end <- max(as.Date(partial$date))
-      cat("  Fetching", length(pkgs), "packages from",
-          format(repair_start), "to", format(repair_end), "\n")
+      # Group consecutive dates into contiguous chunks to minimize API calls
+      dates <- sort(as.Date(partial$date))
+      chunks <- list()
+      chunk_start <- dates[1]
+      chunk_end <- dates[1]
+      for (i in seq_along(dates)) {
+        if (i == 1) next
+        if (as.integer(dates[i] - chunk_end) <= 1) {
+          chunk_end <- dates[i]
+        } else {
+          chunks[[length(chunks) + 1]] <- list(start = chunk_start, end = chunk_end)
+          chunk_start <- dates[i]
+          chunk_end <- dates[i]
+        }
+      }
+      chunks[[length(chunks) + 1]] <- list(start = chunk_start, end = chunk_end)
 
-      result_df <- fetch_downloads(pkgs, repair_start, repair_end)
-      if (nrow(result_df) > 0) {
-        n <- insert_downloads(con, result_df)
-        repair_rows <- n
-        rows_added <- rows_added + n
-        cat("  Inserted/updated", n, "repair rows\n")
-      } else {
-        cat("  No repair data returned from API\n")
+      cat("  Grouped into", length(chunks), "contiguous chunk(s)\n")
+      for (ch in chunks) {
+        span <- as.integer(ch$end - ch$start) + 1L
+        cat("  Fetching", length(pkgs), "packages for",
+            format(ch$start), "to", format(ch$end), "(", span, "days)\n")
+
+        result_df <- fetch_downloads(pkgs, ch$start, ch$end)
+        if (nrow(result_df) > 0) {
+          n <- insert_downloads(con, result_df)
+          repair_rows <- repair_rows + n
+          rows_added <- rows_added + n
+          cat("    Inserted/updated", n, "rows\n")
+        }
       }
     }
   }
