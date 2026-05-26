@@ -1,60 +1,207 @@
 #!/usr/bin/env Rscript
-# CRAN Downloads — fetch daily download counts from the cranlogs API,
-# with gradual backfill to October 2012. Writes to SQLite (downloads.db).
+# CRAN Downloads — shard-aware producer.
+# Pulls only touched-year shards, runs update logic, exports changed shards.
 
 options(timeout = 120)
 
 library(RSQLite)
 library(jsonlite)
+library(DBI)
 
 # ---------------------------------------------------------------------------
-# CLI argument: path to the SQLite database
+# Utility
+# ---------------------------------------------------------------------------
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ---------------------------------------------------------------------------
+# Source helpers.R — resolve path whether invoked via Rscript or source()
+# ---------------------------------------------------------------------------
+helpers_dir <- tryCatch(
+  dirname(sys.frame(1)$ofile),
+  error = function(e) {
+    args <- commandArgs(trailingOnly = FALSE)
+    f    <- sub("--file=", "", grep("--file=", args, value = TRUE))
+    if (length(f) == 1L && nzchar(f)) dirname(normalizePath(f)) else "scripts"
+  }
+)
+source(file.path(helpers_dir, "helpers.R"))
+
+# ---------------------------------------------------------------------------
+# CLI: output directory for changed shards + manifest
 # ---------------------------------------------------------------------------
 args <- commandArgs(trailingOnly = TRUE)
-db_path <- if (length(args) >= 1) args[1] else "downloads.db"
+out_dir <- if (length(args) >= 1) args[1] else "out"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+cat("Output directory:", out_dir, "\n")
 
-cat("Database path:", db_path, "\n")
-
-# ---------------------------------------------------------------------------
-# Connect and configure SQLite
-# ---------------------------------------------------------------------------
-con <- dbConnect(SQLite(), db_path)
-on.exit(dbDisconnect(con), add = TRUE)
-
-dbExecute(con, "PRAGMA journal_mode=WAL")
-dbExecute(con, "PRAGMA synchronous=NORMAL")
+WORK_DB                    <- file.path(out_dir, "_working.db")
+RECENT_WINDOW              <- 400L
+BACKFILL_TARGET            <- as.Date("2012-10-01")
+BACKFILL_CHUNK_DAYS        <- 30L
+REPAIR_BATCH               <- 30L
+PACKAGE_COVERAGE_THRESHOLD <- 20000L
 
 # ---------------------------------------------------------------------------
-# Create tables
+# Helper: download one asset from the rolling "current" GH release.
+# Returns the exit status (0 = success, non-zero = failure / release absent).
 # ---------------------------------------------------------------------------
-dbExecute(con, "
-CREATE TABLE IF NOT EXISTS downloads_daily (
-  package TEXT NOT NULL,
-  date    TEXT NOT NULL,
-  count   INTEGER NOT NULL,
-  PRIMARY KEY (package, date)
-)")
+gh_download <- function(pattern, dir) {
+  res <- system2("gh",
+    c("release", "download", "current",
+      "--repo", "r-observatory/cran-downloads",
+      "--pattern", pattern,
+      "--dir", dir,
+      "--clobber"),
+    stdout = TRUE, stderr = TRUE)
+  attr(res, "status") %||% 0L
+}
 
-dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_dd_date ON downloads_daily(date)")
+# ===========================================================================
+# 1. Pull downloads-recent.db from the "current" release (always needed).
+#    If the release doesn't exist yet (first run), proceed with empty state.
+# ===========================================================================
+cat("=== 1. Discover and pull shards ===\n")
 
-dbExecute(con, "
-CREATE TABLE IF NOT EXISTS downloads_summary (
-  package      TEXT PRIMARY KEY,
-  total_30d    INTEGER,
-  total_90d    INTEGER,
-  total_365d   INTEGER,
-  rank_30d     INTEGER,
-  rank_90d     INTEGER,
-  rank_365d    INTEGER,
-  avg_daily_30d REAL,
-  trend        REAL
-)")
+recent_status <- gh_download("downloads-recent.db", out_dir)
+recent_path   <- file.path(out_dir, "downloads-recent.db")
+recent_present <- file.exists(recent_path)
 
-dbExecute(con, "
-CREATE TABLE IF NOT EXISTS backfill_state (
-  key   TEXT PRIMARY KEY,
-  value TEXT
-)")
+if (!recent_present) {
+  cat("  No prior 'current' release found — initializing from scratch\n")
+} else {
+  cat("  Loaded downloads-recent.db\n")
+}
+
+# Open working DB
+unlink(WORK_DB)
+con <- DBI::dbConnect(RSQLite::SQLite(), WORK_DB)
+on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
+on.exit(unlink(WORK_DB), add = TRUE)
+
+invisible(DBI::dbExecute(con, "PRAGMA journal_mode=WAL"))
+invisible(DBI::dbExecute(con, "PRAGMA synchronous=NORMAL"))
+
+invisible(DBI::dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS downloads_daily (
+    package TEXT NOT NULL,
+    date    TEXT NOT NULL,
+    count   INTEGER NOT NULL,
+    PRIMARY KEY (package, date)
+  )"))
+invisible(DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_dd_date ON downloads_daily(date)"))
+invisible(DBI::dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS downloads_summary (
+    package       TEXT PRIMARY KEY,
+    total_30d     INTEGER,
+    total_90d     INTEGER,
+    total_365d    INTEGER,
+    rank_30d      INTEGER,
+    rank_90d      INTEGER,
+    rank_365d     INTEGER,
+    avg_daily_30d REAL,
+    trend         REAL
+  )"))
+invisible(DBI::dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS backfill_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+  )"))
+
+if (recent_present) {
+  invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS recent",
+                              normalizePath(recent_path, mustWork = TRUE))))
+  invisible(DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO downloads_daily SELECT * FROM recent.downloads_daily"))
+  has_bf <- nrow(DBI::dbGetQuery(con,
+    "SELECT name FROM recent.sqlite_master WHERE name = 'backfill_state'")) > 0
+  if (has_bf) {
+    invisible(DBI::dbExecute(con,
+      "INSERT OR REPLACE INTO backfill_state SELECT * FROM recent.backfill_state"))
+  }
+  invisible(DBI::dbExecute(con, "DETACH DATABASE recent"))
+  cat("  Seeded working DB from downloads-recent.db\n")
+}
+
+# ===========================================================================
+# 2. Determine which years this run will touch.
+#    We derive forward_dates, backfill_range, and repair_dates from the
+#    current working DB state — same logic as in the old update.R — and feed
+#    them into compute_touched_years() to decide which year shards to pull.
+# ===========================================================================
+cat("=== 2. Compute touched years ===\n")
+
+today     <- Sys.Date()
+yesterday <- today - 1L
+
+latest_date <- {
+  r <- DBI::dbGetQuery(con, "SELECT MAX(date) AS d FROM downloads_daily")
+  if (is.na(r$d[1])) NULL else as.Date(r$d[1])
+}
+
+forward_start <- if (is.null(latest_date)) today - 30L else latest_date + 1L
+forward_dates <- if (forward_start <= yesterday) {
+  seq(forward_start, yesterday, by = 1)
+} else {
+  as.Date(character(0))
+}
+
+frontier_row <- DBI::dbGetQuery(con,
+  "SELECT value FROM backfill_state WHERE key = 'backfill_frontier'")
+frontier <- if (nrow(frontier_row) > 0) as.Date(frontier_row$value[1]) else (today - 30L)
+
+backfill_range <- if (frontier > BACKFILL_TARGET) {
+  chunk_end   <- frontier - 1L
+  chunk_start <- max(frontier - BACKFILL_CHUNK_DAYS, BACKFILL_TARGET)
+  list(start = chunk_start, end = chunk_end)
+} else {
+  NULL
+}
+
+partial <- DBI::dbGetQuery(con, sprintf("
+  SELECT date FROM (
+    SELECT date, COUNT(DISTINCT package) AS pkg_count
+      FROM downloads_daily
+     GROUP BY date
+    HAVING pkg_count < %d
+  )
+  ORDER BY date DESC
+  LIMIT %d", PACKAGE_COVERAGE_THRESHOLD, REPAIR_BATCH))
+repair_dates <- partial$date
+
+touched_years <- compute_touched_years(forward_dates, backfill_range, repair_dates)
+cat("  Forward dates:   ", length(forward_dates), "days\n")
+cat("  Backfill range:  ",
+    if (is.null(backfill_range)) "none" else paste(backfill_range$start, "to", backfill_range$end),
+    "\n")
+cat("  Repair dates:    ", length(repair_dates), "dates\n")
+cat("  Touched years:   ", paste(touched_years, collapse = ", "), "\n")
+
+# ===========================================================================
+# 3. Pull each touched-year shard into the working DB.
+# ===========================================================================
+cat("=== 3. Pull year shards ===\n")
+
+for (yr in touched_years) {
+  shard      <- sprintf("downloads-%04d.db", yr)
+  shard_path <- file.path(out_dir, shard)
+  if (!file.exists(shard_path)) {
+    gh_download(shard, out_dir)
+  }
+  if (file.exists(shard_path)) {
+    invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS yr",
+                                normalizePath(shard_path, mustWork = TRUE))))
+    invisible(DBI::dbExecute(con,
+      "INSERT OR REPLACE INTO downloads_daily SELECT * FROM yr.downloads_daily"))
+    invisible(DBI::dbExecute(con, "DETACH DATABASE yr"))
+    cat("  Loaded shard:", shard, "\n")
+  } else {
+    cat("  Shard not in release (new year):", shard, "\n")
+  }
+}
+
+# ===========================================================================
+# 4. Forward / Backfill / Repair  (verbatim from prior update.R)
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Fetch CRAN package list once (reused by forward fetch and backfill)
@@ -71,10 +218,10 @@ cat("Found", length(cran_packages), "packages on CRAN\n")
 # ---------------------------------------------------------------------------
 # Tracking variables for release notes
 # ---------------------------------------------------------------------------
-rows_added <- 0L
-forward_rows <- 0L
+rows_added    <- 0L
+forward_rows  <- 0L
 backfill_rows <- 0L
-repair_rows <- 0L
+repair_rows   <- 0L
 
 # ---------------------------------------------------------------------------
 # Helper: fetch download data from cranlogs API
@@ -187,9 +334,9 @@ insert_downloads <- function(con, df) {
 }
 
 # =========================================================================
-# 1. Forward Fetch (new days since last in DB)
+# Forward Fetch (new days since last in DB)
 # =========================================================================
-cat("\n=== 1. Forward Fetch ===\n")
+cat("\n=== 4a. Forward Fetch ===\n")
 tryCatch({
   today <- Sys.Date()
   yesterday <- today - 1  # cranlogs data delayed ~1 day
@@ -235,9 +382,9 @@ tryCatch({
 })
 
 # =========================================================================
-# 2. Backfill (extend history backwards by 1 month each run)
+# Backfill (extend history backwards by 1 month each run)
 # =========================================================================
-cat("\n=== 2. Backfill ===\n")
+cat("\n=== 4b. Backfill ===\n")
 tryCatch({
   today <- Sys.Date()
   backfill_target <- as.Date("2012-10-01")
@@ -296,12 +443,12 @@ tryCatch({
 })
 
 # =========================================================================
-# 3. Repair partial-coverage dates
+# Repair partial-coverage dates
 # =========================================================================
 # Earlier backfills only fetched 5K packages. Re-fetch dates where coverage
 # is below 20K packages using the full CRAN package list. Process up to
 # 30 days per run to stay within workflow time limits.
-cat("\n=== 3. Repair Partial Coverage ===\n")
+cat("\n=== 4c. Repair Partial Coverage ===\n")
 tryCatch({
   # Find dates with fewer than 20K packages (partial backfill)
   partial <- dbGetQuery(con, "
@@ -358,9 +505,9 @@ tryCatch({
 })
 
 # =========================================================================
-# 4. Rebuild downloads_summary
+# 5. Rebuild downloads_summary
 # =========================================================================
-cat("\n=== 4. Rebuild Summary ===\n")
+cat("\n=== 5. Rebuild Summary ===\n")
 tryCatch({
   today <- Sys.Date()
 
@@ -424,56 +571,92 @@ tryCatch({
   tryCatch(dbRollback(con), error = function(e2) NULL)
 })
 
-# =========================================================================
-# 5. Release Notes
-# =========================================================================
-cat("\n=== 5. Release Notes ===\n")
+# ===========================================================================
+# 6. Determine changed years (for now: identical to touched_years).
+# ===========================================================================
+changed_years <- touched_years
 
-total_rows <- tryCatch(
-  dbGetQuery(con, "SELECT COUNT(*) AS n FROM downloads_daily")$n,
-  error = function(e) 0L
-)
+# ===========================================================================
+# 7. Export shards: recent, summary, and each changed-year shard.
+# ===========================================================================
+cat("\n=== 7. Export shards ===\n")
 
-date_range <- tryCatch(
-  dbGetQuery(con, "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM downloads_daily"),
-  error = function(e) data.frame(min_date = NA, max_date = NA)
-)
+# Export recent shard
+recent_rows <- extract_recent_rows(con, today = today, window_days = RECENT_WINDOW)
+recent_out  <- file.path(out_dir, "downloads-recent.db")
+export_shard(recent_out, recent_rows)
+cat("  Exported downloads-recent.db (", nrow(recent_rows), "rows )\n")
 
-summary_count <- tryCatch(
-  dbGetQuery(con, "SELECT COUNT(*) AS n FROM downloads_summary")$n,
-  error = function(e) 0L
-)
-
-frontier_row <- tryCatch(
-  dbGetQuery(con, "SELECT value FROM backfill_state WHERE key = 'backfill_frontier'"),
-  error = function(e) data.frame(value = character(0))
-)
-backfill_progress <- if (nrow(frontier_row) > 0) frontier_row$value[1] else "not started"
-
-db_size_bytes <- file.info(db_path)$size
-if (db_size_bytes >= 1024 * 1024) {
-  db_size <- sprintf("%.1f MB", db_size_bytes / (1024 * 1024))
-} else {
-  db_size <- sprintf("%.1f KB", db_size_bytes / 1024)
+# Persist backfill_state into downloads-recent.db so the next run can read it
+{
+  rc <- DBI::dbConnect(RSQLite::SQLite(), recent_out)
+  DBI::dbExecute(rc,
+    "CREATE TABLE IF NOT EXISTS backfill_state (key TEXT PRIMARY KEY, value TEXT)")
+  # Copy from working DB
+  work_bf <- DBI::dbGetQuery(con,
+    "SELECT key, value FROM backfill_state")
+  if (nrow(work_bf) > 0) {
+    DBI::dbExecute(rc,
+      "INSERT OR REPLACE INTO backfill_state (key, value) VALUES (?, ?)",
+      params = list(work_bf$key, work_bf$value))
+  }
+  DBI::dbDisconnect(rc)
 }
 
-notes <- paste0(
-  "## CRAN Downloads Update\n\n",
-  "**", format(Sys.time(), "%Y-%m-%d %H:%M UTC", tz = "UTC"), "**\n\n",
-  "| Metric | Value |\n",
-  "|--------|-------|\n",
-  "| Rows added (forward) | ", forward_rows, " |\n",
-  "| Rows added (backfill) | ", backfill_rows, " |\n",
-  "| Rows added (repair) | ", repair_rows, " |\n",
-  "| Total rows added | ", rows_added, " |\n",
-  "| Total rows in DB | ", total_rows, " |\n",
-  "| Date range | ", date_range$min_date, " to ", date_range$max_date, " |\n",
-  "| Summary packages | ", summary_count, " |\n",
-  "| Backfill frontier | ", backfill_progress, " |\n",
-  "| Database size | ", db_size, " |\n"
+# Export summary shard
+summary_df <- DBI::dbGetQuery(con, "SELECT * FROM downloads_summary")
+export_summary_shard(file.path(out_dir, "downloads-summary.db"), summary_df)
+cat("  Exported downloads-summary.db (", nrow(summary_df), "rows )\n")
+
+# Export each changed year shard
+for (yr in changed_years) {
+  rows       <- extract_year_rows(con, yr)
+  shard_name <- sprintf("downloads-%04d.db", yr)
+  export_shard(file.path(out_dir, shard_name), rows)
+  cat("  Exported", shard_name, "(", nrow(rows), "rows )\n")
+}
+
+# ===========================================================================
+# 8. Write manifest.json
+# ===========================================================================
+cat("\n=== 8. Write manifest ===\n")
+
+changed_shards <- c(
+  "downloads-recent.db",
+  "downloads-summary.db",
+  sprintf("downloads-%04d.db", changed_years)
 )
 
-writeLines(notes, "release_notes.md")
-cat("Wrote release_notes.md\n")
+tag <- sprintf("v%s", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC"))
 
-cat("\nDone.\n")
+write_manifest(
+  path           = file.path(out_dir, "manifest.json"),
+  changed_shards = changed_shards,
+  tag            = tag,
+  summary        = list(
+    forward_rows  = forward_rows  %||% 0L,
+    backfill_rows = backfill_rows %||% 0L,
+    repair_rows   = repair_rows   %||% 0L,
+    total_rows    = DBI::dbGetQuery(con,
+                      "SELECT COUNT(*) AS n FROM downloads_daily")$n,
+    date_range    = list(
+      min = DBI::dbGetQuery(con, "SELECT MIN(date) AS d FROM downloads_daily")$d,
+      max = DBI::dbGetQuery(con, "SELECT MAX(date) AS d FROM downloads_daily")$d
+    )
+  )
+)
+cat("  Wrote manifest.json\n")
+
+# ===========================================================================
+# 9. Write release_notes.md (used by the workflow's release publishing step)
+# ===========================================================================
+writeLines(
+  sprintf("## CRAN Downloads %s\n\nSee manifest.json for changed shards.\n", tag),
+  file.path(out_dir, "release_notes.md")
+)
+cat("  Wrote release_notes.md\n")
+
+# Disconnect working DB (on.exit also covers this, but be explicit)
+try(DBI::dbDisconnect(con), silent = TRUE)
+
+cat("\nDone. Changed shards:\n  - ", paste(changed_shards, collapse = "\n  - "), "\n")
