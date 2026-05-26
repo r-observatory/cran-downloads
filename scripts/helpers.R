@@ -111,3 +111,32 @@ export_shard <- function(path, rows) {
   DBI::dbExecute(con, "VACUUM")
   invisible(NULL)
 }
+
+#' Write a minimal SQLite file containing ONLY the downloads_summary table.
+export_summary_shard <- function(path, summary) {
+  if (file.exists(path)) unlink(path)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  DBI::dbExecute(con, "PRAGMA journal_mode=DELETE")
+  DBI::dbExecute(con, "
+    CREATE TABLE downloads_summary (
+      package       TEXT PRIMARY KEY,
+      total_30d     INTEGER,
+      total_90d     INTEGER,
+      total_365d    INTEGER,
+      rank_30d      INTEGER,
+      rank_90d      INTEGER,
+      rank_365d     INTEGER,
+      avg_daily_30d REAL,
+      trend         REAL
+    )")
+
+  if (nrow(summary) > 0) {
+    DBI::dbWriteTable(con, "downloads_summary", summary, append = TRUE)
+  }
+
+  DBI::dbExecute(con, "VACUUM")
+  invisible(NULL)
+}
