@@ -75,3 +75,39 @@ write_manifest <- function(path, changed_shards, tag, summary) {
   json <- jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, null = "null")
   writeLines(json, path)
 }
+
+#' Write the given rows into a fresh SQLite file at `path`.
+#'
+#' Overwrites any existing file. Always creates the downloads_daily table
+#' with the canonical schema and idx_dd_date index. Runs VACUUM at end so
+#' the file is minimal.
+export_shard <- function(path, rows) {
+  if (file.exists(path)) unlink(path)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  DBI::dbExecute(con, "PRAGMA journal_mode=DELETE")  # no WAL in published shards
+
+  DBI::dbExecute(con, "
+    CREATE TABLE downloads_daily (
+      package TEXT NOT NULL,
+      date    TEXT NOT NULL,
+      count   INTEGER NOT NULL,
+      PRIMARY KEY (package, date)
+    )")
+  DBI::dbExecute(con, "CREATE INDEX idx_dd_date ON downloads_daily(date)")
+
+  if (nrow(rows) > 0) {
+    DBI::dbBegin(con)
+    DBI::dbExecute(
+      con,
+      "INSERT INTO downloads_daily (package, date, count) VALUES (?, ?, ?)",
+      params = list(rows$package, rows$date, rows$count)
+    )
+    DBI::dbCommit(con)
+  }
+
+  DBI::dbExecute(con, "VACUUM")
+  invisible(NULL)
+}
