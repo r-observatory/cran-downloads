@@ -629,17 +629,26 @@ changed_shards <- c(
 
 tag <- sprintf("v%s", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC"))
 
+# The working DB only contains rows from touched years + the rolling recent
+# window — not every shard on the release. So "working_db_rows" is what we
+# can honestly report from this process. Computing the union across every
+# year shard would require downloading shards we deliberately skipped.
+working_db_rows <- DBI::dbGetQuery(con,
+  "SELECT COUNT(*) AS n FROM downloads_daily")$n
+
 write_manifest(
   path           = file.path(out_dir, "manifest.json"),
   changed_shards = changed_shards,
   tag            = tag,
   summary        = list(
-    forward_rows  = forward_rows  %||% 0L,
-    backfill_rows = backfill_rows %||% 0L,
-    repair_rows   = repair_rows   %||% 0L,
-    total_rows    = DBI::dbGetQuery(con,
-                      "SELECT COUNT(*) AS n FROM downloads_daily")$n,
-    date_range    = list(
+    forward_rows     = forward_rows  %||% 0L,
+    backfill_rows    = backfill_rows %||% 0L,
+    repair_rows      = repair_rows   %||% 0L,
+    working_db_rows  = working_db_rows,
+    note             = paste("working_db_rows counts rows from touched years +",
+                             "recent window only; sum each year shard for the",
+                             "true total across all release assets"),
+    date_range_in_working_db = list(
       min = DBI::dbGetQuery(con, "SELECT MIN(date) AS d FROM downloads_daily")$d,
       max = DBI::dbGetQuery(con, "SELECT MAX(date) AS d FROM downloads_daily")$d
     )
