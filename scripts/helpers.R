@@ -26,3 +26,20 @@ compute_touched_years <- function(forward_dates, backfill_range, repair_dates) {
 
   sort(unique(years))
 }
+
+#' Extract all downloads_daily rows for a single year.
+#'
+#' @param con  SQLite connection (working DB with downloads_daily table)
+#' @param year integer
+#' @return data.frame(package, date, count)
+extract_year_rows <- function(con, year) {
+  year_prefix <- sprintf("%04d", as.integer(year))
+  DBI::dbGetQuery(
+    con,
+    "SELECT package, date, count
+       FROM downloads_daily
+      WHERE substr(date, 1, 4) = ?
+      ORDER BY package, date",
+    params = list(year_prefix)
+  )
+}
