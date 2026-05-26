@@ -43,3 +43,21 @@ extract_year_rows <- function(con, year) {
     params = list(year_prefix)
   )
 }
+
+#' Extract the rolling N-day window of downloads_daily rows.
+#'
+#' @param con         SQLite connection
+#' @param today       Date — reference "now"
+#' @param window_days integer — how many days back, inclusive of cutoff
+#' @return data.frame(package, date, count)
+extract_recent_rows <- function(con, today, window_days) {
+  cutoff <- format(today - as.integer(window_days), "%Y-%m-%d")
+  DBI::dbGetQuery(
+    con,
+    "SELECT package, date, count
+       FROM downloads_daily
+      WHERE date >= ?
+      ORDER BY package, date",
+    params = list(cutoff)
+  )
+}
