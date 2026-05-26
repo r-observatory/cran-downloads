@@ -1,76 +1,108 @@
 # CRAN Downloads
 
-Daily download counts for every CRAN package, sourced from the [cranlogs API](https://cranlogs.r-pkg.org/) (RStudio CRAN mirror logs). The pipeline runs daily, fetching new download data and gradually backfilling history to October 2012. All data is stored in a single SQLite database (`downloads.db`) and published as a GitHub release.
+Daily download counts for every CRAN package, sourced from the [cranlogs API](https://cranlogs.r-pkg.org/) (RStudio CRAN mirror logs). The pipeline runs daily, fetching new download data and gradually backfilling history to October 2012. Data is published as a set of SQLite shard files attached to a single rolling GitHub release tag (`current`).
 
 ## Data Access
 
-### CLI
+All shards live as assets on the [`current` release](https://github.com/r-observatory/cran-downloads/releases/tag/current). Each daily run uploads only the shards that changed; the rest remain unchanged.
+
+### Recent data (last 400 days)
+
+For most use cases, this is the only file you need. It contains the rolling 400-day window of `downloads_daily` plus the full `downloads_summary` table.
 
 ```bash
-gh release download latest --repo r-observatory/cran-downloads --pattern "downloads.db"
+gh release download current \
+  --repo r-observatory/cran-downloads \
+  --pattern "downloads-recent.db"
 ```
 
-### R
-
 ```r
-url <- "https://github.com/r-observatory/cran-downloads/releases/latest/download/downloads.db"
-download.file(url, "downloads.db", mode = "wb")
+url <- "https://github.com/r-observatory/cran-downloads/releases/download/current/downloads-recent.db"
+download.file(url, "downloads-recent.db", mode = "wb")
 
 library(RSQLite)
-con <- dbConnect(SQLite(), "downloads.db")
+con <- dbConnect(SQLite(), "downloads-recent.db")
 
-# Daily downloads for a package
+# Last 30 days of ggplot2 downloads
 dbGetQuery(con, "
-  SELECT date, count
-  FROM downloads_daily
+  SELECT date, count FROM downloads_daily
   WHERE package = 'ggplot2'
-  ORDER BY date DESC
-  LIMIT 30
+  ORDER BY date DESC LIMIT 30
 ")
 
-# Top packages by monthly downloads
+# Top packages by 30-day downloads
 dbGetQuery(con, "
   SELECT package, total_30d, avg_daily_30d, rank_30d
   FROM downloads_summary
-  ORDER BY rank_30d
-  LIMIT 20
+  ORDER BY rank_30d LIMIT 20
 ")
 
 dbDisconnect(con)
 ```
 
-### Python
+### Per-year archives
 
-```python
-import urllib.request
-import sqlite3
+Each calendar year has its own shard:
 
-url = "https://github.com/r-observatory/cran-downloads/releases/latest/download/downloads.db"
-urllib.request.urlretrieve(url, "downloads.db")
+```bash
+gh release download current \
+  --repo r-observatory/cran-downloads \
+  --pattern "downloads-2024.db"
+```
 
-con = sqlite3.connect("downloads.db")
-cur = con.cursor()
+### Full history (all years)
 
-# Daily downloads for a package
-cur.execute("""
-    SELECT date, count
-    FROM downloads_daily
-    WHERE package = 'ggplot2'
-    ORDER BY date DESC
-    LIMIT 30
-""")
-print(cur.fetchall())
+```bash
+gh release download current \
+  --repo r-observatory/cran-downloads \
+  --pattern "downloads-*.db"
+```
 
-# Top packages by monthly downloads
-cur.execute("""
-    SELECT package, total_30d, avg_daily_30d, rank_30d
-    FROM downloads_summary
-    ORDER BY rank_30d
-    LIMIT 20
-""")
-print(cur.fetchall())
+To query across years, ATTACH the shards or UNION them:
 
-con.close()
+```r
+library(RSQLite)
+con <- dbConnect(SQLite(), ":memory:")
+for (yr in 2012:2026) {
+  shard <- sprintf("downloads-%04d.db", yr)
+  if (file.exists(shard)) {
+    dbExecute(con, sprintf("ATTACH '%s' AS y%d", shard, yr))
+  }
+}
+
+# Union ggplot2 history across all attached years
+attached_years <- as.integer(sub("^y", "",
+  dbGetQuery(con, "PRAGMA database_list")$name |> setdiff("main")))
+union_sql <- paste(
+  sprintf("SELECT date, count FROM y%d.downloads_daily WHERE package='ggplot2'", attached_years),
+  collapse = " UNION ALL "
+)
+result <- dbGetQuery(con, paste(union_sql, "ORDER BY date"))
+```
+
+### Summary only
+
+For top-package lists, ranks, and trends with the smallest download:
+
+```bash
+gh release download current \
+  --repo r-observatory/cran-downloads \
+  --pattern "downloads-summary.db"
+```
+
+```sql
+SELECT package, total_30d, rank_30d, trend
+  FROM downloads_summary
+ ORDER BY rank_30d LIMIT 50;
+```
+
+### Manifest
+
+`manifest.json` lists which shards changed in the most recent run — useful for downstream consumers doing incremental updates.
+
+```bash
+gh release download current --pattern manifest.json --repo r-observatory/cran-downloads
+cat manifest.json
 ```
 
 ## Example Queries
@@ -79,44 +111,33 @@ con.close()
 
 ```sql
 SELECT date, count
-FROM downloads_daily
-WHERE package = 'dplyr'
-ORDER BY date DESC
-LIMIT 30;
+  FROM downloads_daily
+ WHERE package = 'dplyr'
+ ORDER BY date DESC LIMIT 30;
 ```
 
 ### Top packages by monthly downloads
 
 ```sql
 SELECT package, total_30d, avg_daily_30d, rank_30d, trend
-FROM downloads_summary
-ORDER BY rank_30d
-LIMIT 50;
-```
-
-### Download trend for a package
-
-```sql
-SELECT package, total_30d, trend, avg_daily_30d
-FROM downloads_summary
-WHERE package = 'data.table';
+  FROM downloads_summary
+ ORDER BY rank_30d LIMIT 50;
 ```
 
 ### Fastest growing packages
 
 ```sql
 SELECT package, total_30d, trend
-FROM downloads_summary
-WHERE total_30d > 1000
-ORDER BY trend DESC
-LIMIT 20;
+  FROM downloads_summary
+ WHERE total_30d > 1000
+ ORDER BY trend DESC LIMIT 20;
 ```
 
 ## Schema
 
 ### `downloads_daily`
 
-Daily download counts per package. Accumulated over time with gradual backfill.
+Daily download counts per package. Present in `downloads-recent.db` (last 400 days only) and in each `downloads-YYYY.db` archive (one year per file).
 
 | Column | Type | Description |
 |---|---|---|
@@ -126,7 +147,7 @@ Daily download counts per package. Accumulated over time with gradual backfill.
 
 ### `downloads_summary`
 
-Aggregated download statistics, rebuilt each run.
+Aggregated download statistics, rebuilt each run. Present in `downloads-recent.db` and `downloads-summary.db`.
 
 | Column | Type | Description |
 |---|---|---|
@@ -142,22 +163,12 @@ Aggregated download statistics, rebuilt each run.
 
 ### `backfill_state`
 
-Tracks backfill progress.
+Tracks how far back the producer has fetched. Present in `downloads-recent.db`.
 
 | Column | Type | Description |
 |---|---|---|
 | `key` | TEXT | State key (PK) |
 | `value` | TEXT | State value |
-
-The `backfill_frontier` key records how far back data has been fetched.
-
-## Backfill Schedule
-
-The pipeline gradually extends history backwards by one month per daily run. Starting from the current date, it takes approximately 5 months of daily runs to reach full coverage back to October 2012. The `backfill_state` table tracks progress. Forward fetches (new days) always run first, followed by one month of backfill.
-
-## Update Schedule
-
-The database is updated daily at 07:00 UTC via GitHub Actions. Each run fetches new daily download counts, performs one month of backfill, and rebuilds the summary table. The latest database is always available from the most recent GitHub release.
 
 ## License
 
