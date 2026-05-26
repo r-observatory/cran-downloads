@@ -61,3 +61,17 @@ extract_recent_rows <- function(con, today, window_days) {
     params = list(cutoff)
   )
 }
+
+#' Write the manifest.json describing which shards changed this run.
+#'
+#' Empty arrays are preserved (jsonlite default is to drop them — we force them).
+write_manifest <- function(path, changed_shards, tag, summary) {
+  obj <- list(
+    tag            = tag,
+    generated_at   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    changed_shards = as.list(changed_shards),
+    summary        = summary
+  )
+  json <- jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, null = "null")
+  writeLines(json, path)
+}
