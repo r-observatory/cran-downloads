@@ -37,6 +37,12 @@ cat("Output directory:", out_dir, "\n")
 WORK_DB                    <- file.path(out_dir, "_working.db")
 RECENT_WINDOW              <- 400L
 BACKFILL_TARGET            <- as.Date("2012-10-01")
+# The 2012-10-01 .. 2020 history was backfilled in one pass (full per-package,
+# uncapped) and published directly to the "current" release, so the incremental
+# crawl is no longer needed. Disabling it also stops it from re-pulling and
+# re-publishing those complete year shards with the capped package set. Set back
+# to TRUE to resume the crawl. Forward fetch and repair are unaffected.
+BACKFILL_ENABLED           <- FALSE
 BACKFILL_CHUNK_DAYS        <- 30L
 REPAIR_BATCH               <- 30L
 PACKAGE_COVERAGE_THRESHOLD <- 20000L
@@ -149,7 +155,7 @@ frontier_row <- DBI::dbGetQuery(con,
   "SELECT value FROM backfill_state WHERE key = 'backfill_frontier'")
 frontier <- if (nrow(frontier_row) > 0) as.Date(frontier_row$value[1]) else (today - 30L)
 
-backfill_range <- if (frontier > BACKFILL_TARGET) {
+backfill_range <- if (BACKFILL_ENABLED && frontier > BACKFILL_TARGET) {
   chunk_end   <- frontier - 1L
   chunk_start <- max(frontier - BACKFILL_CHUNK_DAYS, BACKFILL_TARGET)
   list(start = chunk_start, end = chunk_end)
