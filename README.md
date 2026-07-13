@@ -173,3 +173,7 @@ Tracks how far back the producer has fetched. Present in `downloads-recent.db`.
 ## License
 
 Download data is sourced from the [cranlogs API](https://cranlogs.r-pkg.org/), which provides logs from the RStudio CRAN mirror. This repository provides the pipeline infrastructure and daily snapshots. Please respect the cranlogs API terms of use and rate limits.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
