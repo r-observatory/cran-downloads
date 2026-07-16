@@ -610,8 +610,9 @@ cat("  Exported downloads-recent.db (", nrow(recent_rows), "rows )\n")
 }
 
 # Export summary shard
-summary_df <- DBI::dbGetQuery(con, "SELECT * FROM downloads_summary")
-export_summary_shard(file.path(out_dir, "downloads-summary.db"), summary_df)
+summary_out <- file.path(out_dir, "downloads-summary.db")
+summary_df  <- DBI::dbGetQuery(con, "SELECT * FROM downloads_summary")
+export_summary_shard(summary_out, summary_df)
 cat("  Exported downloads-summary.db (", nrow(summary_df), "rows )\n")
 
 # Export each changed year shard
@@ -642,10 +643,19 @@ tag <- sprintf("v%s", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC"))
 working_db_rows <- DBI::dbGetQuery(con,
   "SELECT COUNT(*) AS n FROM downloads_daily")$n
 
+# Integrity / completeness core for the summary DB the downstream merge pulls.
+# Computed from the finalized on-disk downloads-summary.db (written above) so
+# db_bytes/db_sha256 describe the exact bytes uploaded to the release. The
+# summary is a full rebuild from the maintained rolling window each run (its
+# 30/90/365-day totals sit inside the always-loaded recent window), so it is a
+# complete snapshot: complete = TRUE.
+integrity_core <- summary_integrity_core(summary_out, complete = TRUE)
+
 write_manifest(
   path           = file.path(out_dir, "manifest.json"),
   changed_shards = changed_shards,
   tag            = tag,
+  core           = integrity_core,
   summary        = list(
     forward_rows     = forward_rows  %||% 0L,
     backfill_rows    = backfill_rows %||% 0L,
