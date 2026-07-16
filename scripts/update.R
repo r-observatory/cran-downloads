@@ -645,10 +645,12 @@ working_db_rows <- DBI::dbGetQuery(con,
 
 # Integrity / completeness core for the summary DB the downstream merge pulls.
 # Computed from the finalized on-disk downloads-summary.db (written above) so
-# db_bytes/db_sha256 describe the exact bytes uploaded to the release. The
-# summary is a full rebuild from the maintained rolling window each run (its
-# 30/90/365-day totals sit inside the always-loaded recent window), so it is a
-# complete snapshot: complete = TRUE.
+# db_bytes/db_sha256 describe the exact bytes uploaded to the release.
+#
+# complete = TRUE: the DB holds the full, non-partial dataset (a full rebuild
+# each run, not an incremental/partial one); freshness is tracked separately
+# via generated_at and the fingerprint. A pipeline with a genuine
+# partial/bootstrap state would derive this flag instead of hardcoding it.
 integrity_core <- summary_integrity_core(summary_out, complete = TRUE)
 
 write_manifest(

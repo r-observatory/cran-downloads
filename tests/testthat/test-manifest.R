@@ -60,7 +60,10 @@ test_that("summary_integrity_core reports filename, bytes, sha256, tables, compl
   core <- summary_integrity_core(db, complete = TRUE)
 
   expect_equal(core$db_filename, basename(db))
-  expect_equal(core$db_bytes, as.integer(file.size(db)))
+  # db_bytes is a double (not cast to integer) so files >= ~2 GiB do not
+  # overflow to NA; compare against the uncast file.size() directly.
+  expect_type(core$db_bytes, "double")
+  expect_equal(core$db_bytes, file.size(db))
   # sha256 is lowercase 64-char hex of the exact file bytes
   expect_match(core$db_sha256, "^[0-9a-f]{64}$")
   # tables maps every user table to its row count
@@ -69,12 +72,28 @@ test_that("summary_integrity_core reports filename, bytes, sha256, tables, compl
 })
 
 test_that("summary_integrity_core sha256 matches an independent digest of the bytes", {
-  skip_if_not_installed("digest")
+  # Compute the expected hash via an external CLI tool, independent of
+  # file_sha256()'s own preferred backend (digest/openssl), so this test
+  # genuinely cross-checks the code path instead of re-running the same
+  # library. Skip only if neither tool is on PATH (both are expected on CI).
+  sha256sum_bin <- Sys.which("sha256sum")
+  shasum_bin    <- Sys.which("shasum")
+  if (!nzchar(sha256sum_bin) && !nzchar(shasum_bin)) {
+    skip("neither sha256sum nor shasum is on PATH")
+  }
+
   db <- build_summary_db(2L)
   on.exit(unlink(db))
 
   core <- summary_integrity_core(db)
-  independent <- tolower(digest::digest(file = db, algo = "sha256"))
+
+  if (nzchar(sha256sum_bin)) {
+    out <- system2(sha256sum_bin, shQuote(db), stdout = TRUE)
+  } else {
+    out <- system2(shasum_bin, c("-a", "256", shQuote(db)), stdout = TRUE)
+  }
+  independent <- tolower(sub("\\s.*$", "", out[1]))
+
   expect_equal(core$db_sha256, independent)
 })
 
@@ -100,7 +119,7 @@ test_that("write_manifest merges the integrity core as top-level fields", {
   expect_equal(parsed$summary$forward_rows, 1L)
   # new top-level integrity/completeness core
   expect_equal(parsed$db_filename, basename(db))
-  expect_equal(parsed$db_bytes, as.integer(file.size(db)))
+  expect_equal(parsed$db_bytes, file.size(db))
   expect_match(parsed$db_sha256, "^[0-9a-f]{64}$")
   expect_equal(parsed$tables$downloads_summary, 4L)
   expect_true(parsed$complete)
