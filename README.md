@@ -170,6 +170,16 @@ Tracks how far back the producer has fetched. Present in `downloads-recent.db`.
 | `key` | TEXT | State key (PK) |
 | `value` | TEXT | State value |
 
+### `repair_ledger`
+
+Dates with fewer than 20,000 packages are refetched by a repair pass. Many are low-traffic days where cranlogs has no more rows to give, so each attempt is logged here and a date is refetched at most once a week unless its package count changes. Present in `downloads-recent.db`.
+
+| Column | Type | Description |
+|---|---|---|
+| `date` | TEXT | Date that was refetched (PK) |
+| `attempted_on` | TEXT | Day of the last refetch |
+| `pkg_count` | INTEGER | Distinct packages stored for `date` after that refetch |
+
 ## License
 
 Download data is sourced from the [cranlogs API](https://cranlogs.r-pkg.org/), which provides logs from the RStudio CRAN mirror. This repository provides the pipeline infrastructure and daily snapshots. Please respect the cranlogs API terms of use and rate limits.

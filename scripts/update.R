@@ -45,7 +45,14 @@ BACKFILL_TARGET            <- as.Date("2012-10-01")
 BACKFILL_ENABLED           <- FALSE
 BACKFILL_CHUNK_DAYS        <- 30L
 REPAIR_BATCH               <- 30L
-PACKAGE_COVERAGE_THRESHOLD <- 20000L
+PACKAGE_COVERAGE_THRESHOLD <- as.integer(Sys.getenv("PACKAGE_COVERAGE_THRESHOLD", "20000"))
+# Low-traffic days sit below the threshold for good (cranlogs returns the same
+# rows every time), so a date is refetched at most once per REPAIR_RETRY_DAYS
+# unless its package count changed.
+REPAIR_RETRY_DAYS          <- 7L
+# Wall-clock minutes backfill + repair may use, so the forward fetch always
+# reaches the publish step inside the 120-minute job timeout.
+MAINTENANCE_BUDGET_MIN     <- as.numeric(Sys.getenv("MAINTENANCE_BUDGET_MIN", "45"))
 
 # ---------------------------------------------------------------------------
 # Helper: download one asset from the rolling "current" GH release.
@@ -112,6 +119,8 @@ invisible(DBI::dbExecute(con, "
     key   TEXT PRIMARY KEY,
     value TEXT
   )"))
+invisible(DBI::dbExecute(con, REPAIR_LEDGER_SQL))
+prior_ledger <- read_repair_ledger(con)
 
 if (recent_present) {
   invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS recent",
@@ -124,8 +133,16 @@ if (recent_present) {
     invisible(DBI::dbExecute(con,
       "INSERT OR REPLACE INTO backfill_state SELECT * FROM recent.backfill_state"))
   }
+  prior_ledger <- read_repair_ledger(con, schema = "recent")
   invisible(DBI::dbExecute(con, "DETACH DATABASE recent"))
-  cat("  Seeded working DB from downloads-recent.db\n")
+  if (nrow(prior_ledger) > 0) {
+    invisible(DBI::dbExecute(con,
+      "INSERT OR REPLACE INTO repair_ledger (date, attempted_on, pkg_count) VALUES (?, ?, ?)",
+      params = list(prior_ledger$date, prior_ledger$attempted_on,
+                    as.integer(prior_ledger$pkg_count))))
+  }
+  cat("  Seeded working DB from downloads-recent.db (repair ledger:",
+      nrow(prior_ledger), "dates)\n")
 }
 
 # ===========================================================================
@@ -163,23 +180,29 @@ backfill_range <- if (BACKFILL_ENABLED && frontier > BACKFILL_TARGET) {
   NULL
 }
 
-partial <- DBI::dbGetQuery(con, sprintf("
-  SELECT date FROM (
-    SELECT date, COUNT(DISTINCT package) AS pkg_count
-      FROM downloads_daily
-     GROUP BY date
-    HAVING pkg_count < %d
-  )
-  ORDER BY date DESC
-  LIMIT %d", PACKAGE_COVERAGE_THRESHOLD, REPAIR_BATCH))
-repair_dates <- partial$date
+partial_dates_sql <- sprintf("
+  SELECT date, COUNT(DISTINCT package) AS pkg_count
+    FROM downloads_daily
+   GROUP BY date
+  HAVING pkg_count < %d", PACKAGE_COVERAGE_THRESHOLD)
+
+# Only the recent window is loaded here, so dates older than it are known
+# through the ledger (with the count recorded at their last attempt).
+partial_recent <- DBI::dbGetQuery(con, partial_dates_sql)
+ledger_only    <- prior_ledger[!(prior_ledger$date %in% partial_recent$date) &
+                                 prior_ledger$pkg_count < PACKAGE_COVERAGE_THRESHOLD,
+                               c("date", "pkg_count"), drop = FALSE]
+repair_dates <- select_repair_dates(
+  rbind(partial_recent, ledger_only), prior_ledger, today = today,
+  retry_days = REPAIR_RETRY_DAYS, limit = REPAIR_BATCH)
 
 touched_years <- compute_touched_years(forward_dates, backfill_range, repair_dates)
 cat("  Forward dates:   ", length(forward_dates), "days\n")
 cat("  Backfill range:  ",
     if (is.null(backfill_range)) "none" else paste(backfill_range$start, "to", backfill_range$end),
     "\n")
-cat("  Repair dates:    ", length(repair_dates), "dates\n")
+cat("  Repair dates:    ", length(repair_dates), "due of",
+    nrow(partial_recent) + nrow(ledger_only), "known partial\n")
 cat("  Touched years:   ", paste(touched_years, collapse = ", "), "\n")
 
 # ===========================================================================
@@ -213,7 +236,7 @@ for (yr in touched_years) {
 # Fetch CRAN package list once (reused by forward fetch and backfill)
 # ---------------------------------------------------------------------------
 cran_packages <- tryCatch({
-  ap <- available.packages(repos = "https://cloud.r-project.org")
+  ap <- available.packages(repos = Sys.getenv("CRAN_REPO_URL", "https://cloud.r-project.org"))
   sort(unique(rownames(ap)))
 }, error = function(e) {
   cat("Warning: Could not get available.packages:", e$message, "\n")
@@ -229,93 +252,7 @@ forward_rows  <- 0L
 backfill_rows <- 0L
 repair_rows   <- 0L
 
-# ---------------------------------------------------------------------------
-# Helper: fetch download data from cranlogs API
-# ---------------------------------------------------------------------------
-fetch_downloads <- function(packages, start_date, end_date) {
-  # Process in batches of 100 packages
-  batch_size <- 100
-  n_pkgs <- length(packages)
-  # Pre-allocate list; grows by doubling if needed (avoids O(n^2) append)
-  capacity <- 1024L
-  all_results <- vector("list", capacity)
-  result_idx <- 0L
-
-  for (batch_start in seq(1, n_pkgs, by = batch_size)) {
-    batch_end <- min(batch_start + batch_size - 1, n_pkgs)
-    batch_pkgs <- packages[batch_start:batch_end]
-    pkg_str <- paste(batch_pkgs, collapse = ",")
-
-    # Process in weekly date chunks to avoid API timeouts
-    chunk_start <- as.Date(start_date)
-    chunk_end_final <- as.Date(end_date)
-
-    while (chunk_start <= chunk_end_final) {
-      chunk_end <- min(chunk_start + 6, chunk_end_final)
-      url <- sprintf(
-        "https://cranlogs.r-pkg.org/downloads/daily/%s:%s/%s",
-        format(chunk_start, "%Y-%m-%d"),
-        format(chunk_end, "%Y-%m-%d"),
-        pkg_str
-      )
-
-      tryCatch({
-        raw <- readLines(url, warn = FALSE)
-        json_text <- paste(raw, collapse = "\n")
-        parsed <- fromJSON(json_text, simplifyVector = FALSE)
-
-        # API returns a list of package objects (or a single object for 1 package)
-        if (!is.null(parsed$package)) {
-          # Single package response — wrap in list
-          parsed <- list(parsed)
-        }
-
-        for (pkg_data in parsed) {
-          pkg_name <- pkg_data$package
-          if (is.null(pkg_name) || is.null(pkg_data$downloads)) next
-
-          downloads <- pkg_data$downloads
-          if (length(downloads) == 0) next
-
-          # Extract day and downloads from each entry
-          days <- vapply(downloads, function(d) d$day, character(1))
-          counts <- vapply(downloads, function(d) as.integer(d$downloads), integer(1))
-
-          # Filter out zero-download days to save space
-          nonzero <- counts > 0L
-          if (any(nonzero)) {
-            result_idx <- result_idx + 1L
-            if (result_idx > capacity) {
-              capacity <- capacity * 2L
-              length(all_results) <- capacity
-            }
-            all_results[[result_idx]] <- data.frame(
-              package = pkg_name,
-              date = days[nonzero],
-              count = counts[nonzero],
-              stringsAsFactors = FALSE
-            )
-          }
-        }
-      }, error = function(e) {
-        cat("  API error for batch", batch_start, "-", batch_end,
-            "dates", format(chunk_start), "-", format(chunk_end),
-            ":", e$message, "\n")
-      })
-
-      Sys.sleep(0.5)  # Rate limiting
-      chunk_start <- chunk_end + 1
-    }
-  }
-
-  # Combine all results
-  if (result_idx > 0L) {
-    do.call(rbind, all_results[seq_len(result_idx)])
-  } else {
-    data.frame(package = character(0), date = character(0),
-               count = integer(0), stringsAsFactors = FALSE)
-  }
-}
+# fetch_downloads() lives in helpers.R.
 
 # ---------------------------------------------------------------------------
 # Helper: insert download data into DB in a transaction
@@ -390,10 +327,15 @@ tryCatch({
 # =========================================================================
 # Backfill (extend history backwards by 1 month each run)
 # =========================================================================
+maint_deadline <- Sys.time() + MAINTENANCE_BUDGET_MIN * 60
+cat("\nBackfill + repair budget:", MAINTENANCE_BUDGET_MIN, "min (until",
+    format(maint_deadline, "%H:%M:%S", tz = "UTC"), "UTC)\n")
+
 cat("\n=== 4b. Backfill ===\n")
-tryCatch({
+if (!BACKFILL_ENABLED) cat("  Backfill disabled (BACKFILL_ENABLED = FALSE)\n")
+if (BACKFILL_ENABLED) tryCatch({
   today <- Sys.Date()
-  backfill_target <- as.Date("2012-10-01")
+  backfill_target <- BACKFILL_TARGET
 
   # Read current backfill frontier
   frontier_row <- dbGetQuery(con,
@@ -423,7 +365,8 @@ tryCatch({
 
     if (length(pkgs) > 0) {
       cat("  Fetching backfill downloads for", length(pkgs), "packages\n")
-      result_df <- fetch_downloads(pkgs, backfill_start, backfill_end)
+      result_df <- fetch_downloads(pkgs, backfill_start, backfill_end,
+                                   deadline = maint_deadline)
       if (nrow(result_df) > 0) {
         n <- insert_downloads(con, result_df)
         backfill_rows <- n
@@ -433,11 +376,14 @@ tryCatch({
         cat("  No backfill data returned from API\n")
       }
 
-      # Update frontier
-      dbExecute(con,
-        "INSERT OR REPLACE INTO backfill_state (key, value) VALUES ('backfill_frontier', ?)",
-        params = list(format(backfill_start, "%Y-%m-%d")))
-      cat("  Updated backfill frontier to", format(backfill_start), "\n")
+      if (isTRUE(attr(result_df, "truncated"))) {
+        cat("  Budget reached mid-chunk; frontier stays at", format(frontier), "\n")
+      } else {
+        dbExecute(con,
+          "INSERT OR REPLACE INTO backfill_state (key, value) VALUES ('backfill_frontier', ?)",
+          params = list(format(backfill_start, "%Y-%m-%d")))
+        cat("  Updated backfill frontier to", format(backfill_start), "\n")
+      }
     } else {
       cat("  No packages found, skipping backfill\n")
     }
@@ -451,59 +397,51 @@ tryCatch({
 # =========================================================================
 # Repair partial-coverage dates
 # =========================================================================
-# Earlier backfills only fetched 5K packages. Re-fetch dates where coverage
-# is below 20K packages using the full CRAN package list. Process up to
-# 30 days per run to stay within workflow time limits.
+# Refetch dates below PACKAGE_COVERAGE_THRESHOLD packages, skipping any date
+# refetched in the last REPAIR_RETRY_DAYS whose count has not changed since,
+# and stopping when the backfill + repair budget runs out.
 cat("\n=== 4c. Repair Partial Coverage ===\n")
+repair_attempted <- character(0)
 tryCatch({
-  # Find dates with fewer than 20K packages (partial backfill)
-  partial <- dbGetQuery(con, "
-    SELECT date, COUNT(DISTINCT package) AS pkg_count
-    FROM downloads_daily
-    GROUP BY date
-    HAVING pkg_count < 20000
-    ORDER BY date DESC
-    LIMIT 30
-  ")
+  partial <- dbGetQuery(con, partial_dates_sql)
+  # Only dates in a shard this run exports can be repaired for good.
+  partial <- partial[as.integer(substr(partial$date, 1, 4)) %in% touched_years, ,
+                     drop = FALSE]
+  ledger  <- read_repair_ledger(con)
+  due     <- select_repair_dates(partial, ledger, today = Sys.Date(),
+                                 retry_days = REPAIR_RETRY_DAYS,
+                                 limit = REPAIR_BATCH)
 
-  if (nrow(partial) == 0) {
-    cat("  No partial-coverage dates found — all dates have full coverage\n")
-  } else {
-    cat("  Found", nrow(partial), "dates with partial coverage\n")
+  cat("  Found", nrow(partial), "partial-coverage dates;", length(due),
+      "due for a refetch\n")
 
-    pkgs <- cran_packages
-    if (length(pkgs) > 0) {
-      # Group consecutive dates into contiguous chunks to minimize API calls
-      dates <- sort(as.Date(partial$date))
-      chunks <- list()
-      chunk_start <- dates[1]
-      chunk_end <- dates[1]
-      for (i in seq_along(dates)) {
-        if (i == 1) next
-        if (as.integer(dates[i] - chunk_end) <= 1) {
-          chunk_end <- dates[i]
-        } else {
-          chunks[[length(chunks) + 1]] <- list(start = chunk_start, end = chunk_end)
-          chunk_start <- dates[i]
-          chunk_end <- dates[i]
-        }
+  pkgs <- cran_packages
+  if (length(due) > 0 && length(pkgs) > 0) {
+    chunks <- group_contiguous_dates(due)
+    cat("  Grouped into", length(chunks), "contiguous chunk(s)\n")
+    for (ch in chunks) {
+      if (seconds_left(maint_deadline) <= 0) {
+        cat("  Budget spent; deferring the remaining chunks to the next run\n")
+        break
       }
-      chunks[[length(chunks) + 1]] <- list(start = chunk_start, end = chunk_end)
+      span <- as.integer(ch$end - ch$start) + 1L
+      cat("  Fetching", length(pkgs), "packages for",
+          format(ch$start), "to", format(ch$end), "(", span, "days)\n")
 
-      cat("  Grouped into", length(chunks), "contiguous chunk(s)\n")
-      for (ch in chunks) {
-        span <- as.integer(ch$end - ch$start) + 1L
-        cat("  Fetching", length(pkgs), "packages for",
-            format(ch$start), "to", format(ch$end), "(", span, "days)\n")
-
-        result_df <- fetch_downloads(pkgs, ch$start, ch$end)
-        if (nrow(result_df) > 0) {
-          n <- insert_downloads(con, result_df)
-          repair_rows <- repair_rows + n
-          rows_added <- rows_added + n
-          cat("    Inserted/updated", n, "rows\n")
-        }
+      result_df <- fetch_downloads(pkgs, ch$start, ch$end, deadline = maint_deadline)
+      if (nrow(result_df) > 0) {
+        n <- insert_downloads(con, result_df)
+        repair_rows <- repair_rows + n
+        rows_added <- rows_added + n
+        cat("    Inserted/updated", n, "rows\n")
       }
+      if (isTRUE(attr(result_df, "truncated"))) {
+        cat("    Budget reached mid-chunk; not recorded as attempted\n")
+        break
+      }
+      chunk_dates <- format(seq(ch$start, ch$end, by = 1), "%Y-%m-%d")
+      record_repair_attempts(con, chunk_dates, attempted_on = Sys.Date())
+      repair_attempted <- c(repair_attempted, chunk_dates)
     }
   }
 }, error = function(e) {
@@ -606,6 +544,14 @@ cat("  Exported downloads-recent.db (", nrow(recent_rows), "rows )\n")
       "INSERT OR REPLACE INTO backfill_state (key, value) VALUES (?, ?)",
       params = list(work_bf$key, work_bf$value))
   }
+  DBI::dbExecute(rc, REPAIR_LEDGER_SQL)
+  work_ledger <- read_repair_ledger(con)
+  if (nrow(work_ledger) > 0) {
+    DBI::dbExecute(rc,
+      "INSERT OR REPLACE INTO repair_ledger (date, attempted_on, pkg_count) VALUES (?, ?, ?)",
+      params = list(work_ledger$date, work_ledger$attempted_on,
+                    as.integer(work_ledger$pkg_count)))
+  }
   DBI::dbDisconnect(rc)
 }
 
@@ -662,6 +608,7 @@ write_manifest(
     forward_rows     = forward_rows  %||% 0L,
     backfill_rows    = backfill_rows %||% 0L,
     repair_rows      = repair_rows   %||% 0L,
+    repair_dates_attempted = length(repair_attempted),
     working_db_rows  = working_db_rows,
     note             = paste("working_db_rows counts rows from touched years +",
                              "recent window only; sum each year shard for the",
