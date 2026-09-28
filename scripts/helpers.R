@@ -224,3 +224,169 @@ export_summary_shard <- function(path, summary) {
   DBI::dbExecute(con, "VACUUM")
   invisible(NULL)
 }
+
+# ---------------------------------------------------------------------------
+# cranlogs fetch + repair scheduling
+# ---------------------------------------------------------------------------
+
+#' Fetch daily downloads from cranlogs for `packages` over [start_date, end_date].
+#'
+#' One request per 100-package batch per 7-day window. When `deadline` passes,
+#' no further requests are made and the result carries attr "truncated" = TRUE.
+#' `reader`, `now` and `pause` are injectable for tests.
+fetch_downloads <- function(packages, start_date, end_date,
+                            deadline = Inf,
+                            reader   = function(url) readLines(url, warn = FALSE),
+                            now      = Sys.time,
+                            pause    = function() Sys.sleep(0.5),
+                            batch_size = 100L) {
+  n_pkgs <- length(packages)
+  capacity <- 1024L
+  all_results <- vector("list", capacity)
+  result_idx <- 0L
+  truncated <- FALSE
+
+  for (batch_start in seq(1, max(n_pkgs, 1L), by = batch_size)) {
+    if (n_pkgs == 0L) break
+    batch_end  <- min(batch_start + batch_size - 1L, n_pkgs)
+    pkg_str    <- paste(packages[batch_start:batch_end], collapse = ",")
+    chunk_start     <- as.Date(start_date)
+    chunk_end_final <- as.Date(end_date)
+
+    while (chunk_start <= chunk_end_final) {
+      if (as.numeric(now()) >= as.numeric(deadline)) {
+        truncated <- TRUE
+        break
+      }
+      chunk_end <- min(chunk_start + 6, chunk_end_final)
+      url <- sprintf("%s/downloads/daily/%s:%s/%s",
+                     Sys.getenv("CRANLOGS_URL", "https://cranlogs.r-pkg.org"),
+                     format(chunk_start, "%Y-%m-%d"),
+                     format(chunk_end, "%Y-%m-%d"), pkg_str)
+
+      tryCatch({
+        parsed <- jsonlite::fromJSON(paste(reader(url), collapse = "\n"),
+                                     simplifyVector = FALSE)
+        if (!is.null(parsed$package)) parsed <- list(parsed)
+
+        for (pkg_data in parsed) {
+          pkg_name <- pkg_data$package
+          if (is.null(pkg_name) || is.null(pkg_data$downloads)) next
+          downloads <- pkg_data$downloads
+          if (length(downloads) == 0) next
+          days   <- vapply(downloads, function(d) d$day, character(1))
+          counts <- vapply(downloads, function(d) as.integer(d$downloads), integer(1))
+          nonzero <- counts > 0L  # zero days are not stored
+          if (any(nonzero)) {
+            result_idx <- result_idx + 1L
+            if (result_idx > capacity) {
+              capacity <- capacity * 2L
+              length(all_results) <- capacity
+            }
+            all_results[[result_idx]] <- data.frame(
+              package = pkg_name, date = days[nonzero], count = counts[nonzero],
+              stringsAsFactors = FALSE)
+          }
+        }
+      }, error = function(e) {
+        cat("  API error for batch", batch_start, "-", batch_end,
+            "dates", format(chunk_start), "-", format(chunk_end),
+            ":", conditionMessage(e), "\n")
+      })
+
+      pause()
+      chunk_start <- chunk_end + 1
+    }
+    if (truncated) break
+  }
+
+  out <- if (result_idx > 0L) {
+    do.call(rbind, all_results[seq_len(result_idx)])
+  } else {
+    data.frame(package = character(0), date = character(0),
+               count = integer(0), stringsAsFactors = FALSE)
+  }
+  attr(out, "truncated") <- truncated
+  out
+}
+
+#' Group dates into runs of consecutive days.
+#' @return list of list(start = Date, end = Date), ascending.
+group_contiguous_dates <- function(dates) {
+  dates <- sort(unique(as.Date(dates)))
+  if (length(dates) == 0L) return(list())
+  breaks <- c(TRUE, diff(as.integer(dates)) > 1L)
+  run_id <- cumsum(breaks)
+  lapply(split(dates, run_id), function(d) list(start = min(d), end = max(d))) |>
+    unname()
+}
+
+REPAIR_LEDGER_SQL <- "
+  CREATE TABLE IF NOT EXISTS repair_ledger (
+    date         TEXT PRIMARY KEY,
+    attempted_on TEXT NOT NULL,
+    pkg_count    INTEGER NOT NULL
+  )"
+
+#' Read the repair ledger (one row per date last attempted by the repair pass).
+read_repair_ledger <- function(con, schema = "main") {
+  has <- nrow(DBI::dbGetQuery(con, sprintf(
+    "SELECT name FROM %s.sqlite_master WHERE type = 'table' AND name = 'repair_ledger'",
+    schema))) > 0
+  if (!has) {
+    return(data.frame(date = character(0), attempted_on = character(0),
+                      pkg_count = integer(0), stringsAsFactors = FALSE))
+  }
+  DBI::dbGetQuery(con, sprintf(
+    "SELECT date, attempted_on, pkg_count FROM %s.repair_ledger", schema))
+}
+
+#' Record that `dates` were repaired on `attempted_on`, storing each date's
+#' package count as it stands in downloads_daily after the repair.
+record_repair_attempts <- function(con, dates, attempted_on) {
+  if (length(dates) == 0L) return(invisible(0L))
+  DBI::dbExecute(con, REPAIR_LEDGER_SQL)
+  dates  <- format(as.Date(dates), "%Y-%m-%d")
+  counts <- vapply(dates, function(d) {
+    DBI::dbGetQuery(con,
+      "SELECT COUNT(DISTINCT package) AS n FROM downloads_daily WHERE date = ?",
+      params = list(d))$n
+  }, numeric(1))
+  DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO repair_ledger (date, attempted_on, pkg_count) VALUES (?, ?, ?)",
+    params = list(dates, rep(format(as.Date(attempted_on), "%Y-%m-%d"), length(dates)),
+                  as.integer(counts)))
+  invisible(length(dates))
+}
+
+#' Pick which partial-coverage dates the repair pass should refetch.
+#'
+#' A date is due when it has never been attempted, when its package count
+#' differs from the count recorded after the last attempt, or when the last
+#' attempt is at least `retry_days` old. Never-attempted and changed dates go
+#' first, then the stalest attempts; ties break newest date first.
+#'
+#' @param partial data.frame(date, pkg_count) of dates below the threshold
+#' @param ledger  data.frame(date, attempted_on, pkg_count)
+#' @return character vector of YYYY-MM-DD dates, at most `limit` long
+select_repair_dates <- function(partial, ledger, today, retry_days = 7L,
+                                limit = 30L) {
+  if (nrow(partial) == 0L) return(character(0))
+  m <- merge(partial, ledger, by = "date", all.x = TRUE,
+             suffixes = c("", "_ledger"))
+  never   <- is.na(m$attempted_on)
+  changed <- !never & m$pkg_count != m$pkg_count_ledger
+  stale   <- !never & as.Date(m$attempted_on) <= as.Date(today) - retry_days
+  due <- never | changed | stale
+  m <- m[due, , drop = FALSE]
+  if (nrow(m) == 0L) return(character(0))
+  priority <- ifelse(is.na(m$attempted_on) | m$pkg_count != m$pkg_count_ledger, 0L, 1L)
+  last_try <- ifelse(is.na(m$attempted_on), "", m$attempted_on)
+  ord <- order(priority, last_try, -as.integer(as.Date(m$date)))
+  head(as.character(m$date[ord]), limit)
+}
+
+#' Seconds left before `deadline` (POSIXct), never negative.
+seconds_left <- function(deadline, now = Sys.time()) {
+  max(0, as.numeric(deadline) - as.numeric(now))
+}
