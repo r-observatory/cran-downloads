@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
+    inputs:
+      backfill_packages:
+        description: "Packages to fetch again, separated by commas or spaces (needs backfill_from)."
+        type: string
+        default: ""
+      backfill_from:
+        description: "First day to fetch for backfill_packages, YYYY-MM-DD (needs backfill_packages)."
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -41,6 +50,8 @@ jobs:
       - name: Run update script
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKFILL_PACKAGES: ${{ inputs.backfill_packages }}
+          BACKFILL_FROM: ${{ inputs.backfill_from }}
         run: |
           mkdir -p out
           Rscript scripts/update.R out/

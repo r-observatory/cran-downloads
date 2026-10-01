@@ -60,3 +60,19 @@ test_that("all empty sources returns empty integer vector", {
   )
   expect_equal(result, integer(0))
 })
+
+test_that("a requested backfill adds every year from its start to its end", {
+  result <- compute_touched_years(
+    forward_dates  = as.Date("2026-09-29"),
+    backfill_range = NULL,
+    repair_dates   = character(0),
+    request        = list(packages = "hespdiv", start = as.Date("2021-01-01"),
+                          end = as.Date("2026-09-29"))
+  )
+  expect_equal(result, 2021:2026)
+})
+
+test_that("no request leaves the touched years as they were", {
+  expect_equal(compute_touched_years(as.Date("2026-09-29"), NULL, "2025-12-30", request = NULL),
+               c(2025L, 2026L))
+})

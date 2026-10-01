@@ -1,0 +1,49 @@
+Package: boot
+Version: 1.3-32
+Priority: recommended
+Depends: R (>= 3.0.0), graphics, stats
+Suggests: MASS, survival
+License: Unlimited
+MD5sum: c883de096f9a6b3afbf461337092a1f3
+NeedsCompilation: no
+Published: 2025-08-29 13:00:08 UTC
+
+Package: cli
+Version: 3.6.6
+Depends: R (>= 3.4)
+Imports: utils
+License: MIT + file LICENSE
+MD5sum: eedc08ba864ae6cd640b05eff1a607ee
+NeedsCompilation: yes
+Published: 2026-04-09 09:50:18 UTC
+
+Package: hespdiv
+Version: 1.2.10
+Depends: R (>= 4.0)
+Imports: pracma, DescTools, ggplot2
+Suggests: HDData
+License: GPL-3
+OS_type: windows
+MD5sum: dbe39692f32659adc3e7e8835836ced9
+NeedsCompilation: yes
+Published: 2026-05-21 13:10:02 UTC
+
+Package: laterR
+Version: 0.1.0
+Depends: R (>= 99.0.0)
+Imports: cli
+License: MIT + file LICENSE
+MD5sum: 0f1e2d3c4b5a69788796a5b4c3d2e1f0
+NeedsCompilation: no
+Published: 2026-09-01 10:00:00 UTC
+
+Package: boot
+Version: 1.3-32
+Priority: recommended
+Depends: R (>= 4.7), graphics, stats
+Suggests: MASS, survival
+License: Unlimited
+MD5sum: c883de096f9a6b3afbf461337092a1f3
+NeedsCompilation: no
+Path: 4.7.0/Recommended
+Published: 2025-08-29 13:00:08 UTC

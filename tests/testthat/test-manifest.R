@@ -124,3 +124,31 @@ test_that("write_manifest merges the integrity core as top-level fields", {
   expect_equal(parsed$tables$downloads_summary, 4L)
   expect_true(parsed$complete)
 })
+
+# --- data_through -------------------------------------------------------------
+# The merger's freshness page reads summary$data_through when a manifest has no
+# per-shard coverage map, which this one does not.
+
+test_that("latest_daily_date is the newest day held, or NA when there is none", {
+  con <- new_test_db()
+  on.exit(DBI::dbDisconnect(con))
+  expect_identical(latest_daily_date(con), NA_character_)
+  insert_rows(con, data.frame(package = c("cli", "cli", "rlang"),
+                              date    = c("2026-09-27", "2026-09-28", "2026-09-26"),
+                              count   = c(1510L, 1622L, 980L)))
+  expect_identical(latest_daily_date(con), "2026-09-28")
+})
+
+test_that("summary.data_through is written as a date string, and as null when unknown", {
+  tmp <- tempfile(fileext = ".json")
+  on.exit(unlink(tmp))
+  write_manifest(tmp, changed_shards = "downloads-2026.db", tag = "v20260929-071500",
+                 summary = list(forward_rows = 25222L, data_through = "2026-09-28"))
+  parsed <- jsonlite::read_json(tmp)
+  expect_identical(parsed$summary$data_through, "2026-09-28")
+
+  write_manifest(tmp, changed_shards = character(0), tag = "v20260929-071500",
+                 summary = list(forward_rows = 0L, data_through = NA_character_))
+  expect_match(paste(readLines(tmp), collapse = "\n"), '"data_through": null', fixed = TRUE)
+  expect_null(jsonlite::read_json(tmp)$summary$data_through)
+})

@@ -5,9 +5,16 @@
 #' @param forward_dates  Date vector — dates being forward-fetched (may be empty)
 #' @param backfill_range NULL or list(start=Date, end=Date) — single backfill chunk
 #' @param repair_dates   Character vector — YYYY-MM-DD strings of dates needing repair
+#' @param request        NULL or parse_backfill_request()'s list(packages, start, end)
 #' @return integer vector of years, sorted ascending, no duplicates
-compute_touched_years <- function(forward_dates, backfill_range, repair_dates) {
+compute_touched_years <- function(forward_dates, backfill_range, repair_dates,
+                                  request = NULL) {
   years <- integer(0)
+
+  if (!is.null(request)) {
+    years <- c(years, seq(as.integer(format(request$start, "%Y")),
+                          as.integer(format(request$end, "%Y"))))
+  }
 
   if (length(forward_dates) > 0) {
     years <- c(years, as.integer(format(forward_dates, "%Y")))
@@ -25,6 +32,107 @@ compute_touched_years <- function(forward_dates, backfill_range, repair_dates) {
   }
 
   sort(unique(years))
+}
+
+#' Stop when a year shard the run must load did not download. Every past year is
+#' on the release, so a missing one would be republished holding only this
+#' run's rows; only the current year may be missing, on the first run that
+#' reaches it. A file left by a failed download is never loaded.
+check_shard_pulled <- function(year, present, current_year, status = 0L) {
+  shard <- sprintf("downloads-%04d.db", as.integer(year))
+  if (present && status != 0L) {
+    stop(shard, ": the download failed part way (gh exit ", status,
+         "); stopping before anything is published", call. = FALSE)
+  }
+  if (!present && year < current_year) {
+    stop(shard, " could not be downloaded (gh exit ", status,
+         "); stopping before it is republished without its rows", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+#' The distinct days and the rows in a shard file's downloads_daily.
+shard_stats <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  r <- DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT date) AS days, COUNT(*) AS n FROM downloads_daily")
+  list(days = as.integer(r$days[1]), rows = as.numeric(r$n[1]))
+}
+
+#' Stop when a year shard holds fewer days or fewer rows than the published one
+#' it would replace. `published` is NULL for a shard the release does not have.
+check_shard_not_shrunk <- function(shard, new, published) {
+  if (is.null(published)) return(invisible(TRUE))
+  if (new$days < published$days || new$rows < published$rows) {
+    stop(sprintf(paste("%s holds %d days and %.0f rows but the published shard holds",
+                       "%d days and %.0f rows; stopping before it is replaced"),
+                 shard, new$days, new$rows, published$days, published$rows),
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+#' Asset names from `gh release view --json assets --jq '.assets[].name'`. A
+#' release that does not exist yet has none; any other failure stops the run.
+release_asset_names <- function(output, status) {
+  if (status == 0L) return(output[nzchar(output)])
+  if (any(grepl("release not found", output, fixed = TRUE))) return(character(0))
+  stop("could not list the assets on the release (gh exit ", status,
+       "); stopping before a year shard is replaced unchecked", call. = FALSE)
+}
+
+#' shard_stats() of a year shard as the release holds it now, or NULL when the
+#' release does not list it. `list_assets()` returns the release's asset names;
+#' `download(shard, dir)` fetches the shard into `dir` and returns gh's exit
+#' status. The downloaded copy is removed afterwards.
+published_shard_stats <- function(shard, list_assets, download, dir) {
+  if (!(shard %in% list_assets())) return(NULL)
+  path <- file.path(dir, shard)
+  on.exit(unlink(path), add = TRUE)
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  status <- download(shard, dir)
+  if (status != 0L || !file.exists(path)) {
+    stop(shard, " is on the release but could not be downloaded (gh exit ", status,
+         "); stopping before it is replaced unchecked", call. = FALSE)
+  }
+  shard_stats(path)
+}
+
+#' A dispatch's request to fetch named packages again, from the
+#' backfill_packages and backfill_from inputs, as list(packages, start, end), or
+#' NULL when neither is set. Names split on commas or whitespace; the start is a
+#' YYYY-MM-DD day from the cranlogs start (2012-10-01) to `yesterday`, and the
+#' end is `yesterday`. Anything else stops the run before a download.
+parse_backfill_request <- function(packages, from, yesterday,
+                                   earliest = as.Date("2012-10-01")) {
+  packages <- trimws(if (is.null(packages)) "" else packages)
+  from     <- trimws(if (is.null(from)) "" else from)
+  if (!nzchar(packages) && !nzchar(from)) return(NULL)
+  if (!nzchar(packages) || !nzchar(from)) {
+    stop("backfill_packages and backfill_from must be given together")
+  }
+  pkgs <- unique(strsplit(packages, "[,[:space:]]+")[[1]])
+  pkgs <- pkgs[nzchar(pkgs)]
+  if (length(pkgs) == 0L) stop("backfill_packages names no package")
+  bad  <- pkgs[!grepl("^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$", pkgs)]
+  if (length(bad) > 0L) stop("not a CRAN package name: ", paste(bad, collapse = ", "))
+  start <- as.Date(from, format = "%Y-%m-%d")
+  if (is.na(start) || format(start, "%Y-%m-%d") != from) {
+    stop("backfill_from is not a YYYY-MM-DD date: ", from)
+  }
+  yesterday <- as.Date(yesterday)
+  if (start < earliest || start > yesterday) {
+    stop(sprintf("backfill_from must fall between %s and %s", earliest, yesterday))
+  }
+  list(packages = pkgs, start = start, end = yesterday)
+}
+
+#' The partial-coverage dates the repair pass may take: those in a year this run
+#' exports for its own reasons. A year loaded only for a requested backfill is
+#' left alone, since most of its days sit below the coverage threshold for good.
+repair_candidates <- function(partial, repair_years) {
+  partial[as.integer(substr(partial$date, 1, 4)) %in% repair_years, , drop = FALSE]
 }
 
 #' Extract all downloads_daily rows for a single year.
@@ -60,6 +168,21 @@ extract_recent_rows <- function(con, today, window_days) {
       ORDER BY package, date",
     params = list(cutoff)
   )
+}
+
+#' Every package name CRAN's PACKAGES index lists, sorted. Only the duplicates
+#' filter is applied: the default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner.
+cran_package_names <- function(repos) {
+  ap <- utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+  sort(unique(rownames(ap)))
+}
+
+#' The newest day in downloads_daily as "YYYY-MM-DD", or NA when it is empty.
+#' Published as the manifest's summary$data_through.
+latest_daily_date <- function(con) {
+  d <- DBI::dbGetQuery(con, "SELECT MAX(date) AS d FROM downloads_daily")$d[1]
+  if (is.null(d) || is.na(d) || !nzchar(d)) NA_character_ else as.character(d)
 }
 
 #' Compute the lowercase hex SHA-256 of a file's exact on-disk bytes.

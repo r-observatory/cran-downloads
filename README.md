@@ -2,6 +2,8 @@
 
 Daily download counts for every CRAN package, sourced from the [cranlogs API](https://cranlogs.r-pkg.org/) (RStudio CRAN mirror logs). The pipeline runs daily, fetching new download data and gradually backfilling history to October 2012. Data is published as a set of SQLite shard files attached to a single rolling GitHub release tag (`current`).
 
+The package list is CRAN's `PACKAGES` index read with only the duplicates filter, so packages that declare `OS_type: windows`, or that need a newer R than the runner, are fetched too.
+
 ## Data Access
 
 All shards live as assets on the [`current` release](https://github.com/r-observatory/cran-downloads/releases/tag/current). Each daily run uploads only the shards that changed; the rest remain unchanged.
@@ -98,12 +100,23 @@ SELECT package, total_30d, rank_30d, trend
 
 ### Manifest
 
-`manifest.json` lists which shards changed in the most recent run — useful for downstream consumers doing incremental updates.
+`manifest.json` lists which shards changed in the most recent run, which downstream consumers use for incremental updates. `summary.data_through` is the newest day the data holds, as `YYYY-MM-DD`.
 
 ```bash
 gh release download current --pattern manifest.json --repo r-observatory/cran-downloads
 cat manifest.json
 ```
+
+## Fetching packages again
+
+A manual run can fetch named packages again from a start date, for packages whose history is missing:
+
+```bash
+gh workflow run update.yml --repo r-observatory/cran-downloads \
+  -f backfill_packages="hespdiv,RDesk" -f backfill_from=2021-01-01
+```
+
+The run fetches those packages from `backfill_from` to yesterday after the daily fetch, inside the 45-minute budget it shares with the repair pass, and republishes every year shard from `backfill_from` on. The repair pass leaves alone the years loaded only for the request. `manifest.json` records the request under `summary.backfill_request`, with the rows it wrote and whether the budget ran out first. A request the budget cuts off keeps the rows fetched so far but is not resumed: the same dispatch starts again from `backfill_from`.
 
 ## Example Queries
 

@@ -53,6 +53,11 @@ REPAIR_RETRY_DAYS          <- 7L
 # Wall-clock minutes backfill + repair may use, so the forward fetch always
 # reaches the publish step inside the 120-minute job timeout.
 MAINTENANCE_BUDGET_MIN     <- as.numeric(Sys.getenv("MAINTENANCE_BUDGET_MIN", "45"))
+# A dispatch may name packages to fetch again from a start date. Parsed before
+# anything is downloaded, so a bad request stops here.
+BACKFILL_REQUEST           <- parse_backfill_request(Sys.getenv("BACKFILL_PACKAGES"),
+                                                     Sys.getenv("BACKFILL_FROM"),
+                                                     Sys.Date() - 1L)
 
 # ---------------------------------------------------------------------------
 # Helper: download one asset from the rolling "current" GH release.
@@ -67,6 +72,17 @@ gh_download <- function(pattern, dir) {
       "--clobber"),
     stdout = TRUE, stderr = TRUE)
   attr(res, "status") %||% 0L
+}
+
+# Asset names on the "current" release; stops when they cannot be listed.
+gh_release_assets <- function() {
+  res <- suppressWarnings(system2("gh",
+    c("release", "view", "current",
+      "--repo", "r-observatory/cran-downloads",
+      "--json", "assets",
+      "--jq", shQuote(".assets[].name")),
+    stdout = TRUE, stderr = TRUE))
+  release_asset_names(res, attr(res, "status") %||% 0L)
 }
 
 # ===========================================================================
@@ -196,13 +212,20 @@ repair_dates <- select_repair_dates(
   rbind(partial_recent, ledger_only), prior_ledger, today = today,
   retry_days = REPAIR_RETRY_DAYS, limit = REPAIR_BATCH)
 
-touched_years <- compute_touched_years(forward_dates, backfill_range, repair_dates)
+# The repair pass keeps to the years this run touches for its own reasons.
+repair_years  <- compute_touched_years(forward_dates, backfill_range, repair_dates)
+touched_years <- compute_touched_years(forward_dates, backfill_range, repair_dates,
+                                       BACKFILL_REQUEST)
 cat("  Forward dates:   ", length(forward_dates), "days\n")
 cat("  Backfill range:  ",
     if (is.null(backfill_range)) "none" else paste(backfill_range$start, "to", backfill_range$end),
     "\n")
 cat("  Repair dates:    ", length(repair_dates), "due of",
     nrow(partial_recent) + nrow(ledger_only), "known partial\n")
+cat("  Requested:       ",
+    if (is.null(BACKFILL_REQUEST)) "none" else
+      sprintf("%d packages from %s", length(BACKFILL_REQUEST$packages), BACKFILL_REQUEST$start),
+    "\n")
 cat("  Touched years:   ", paste(touched_years, collapse = ", "), "\n")
 
 # ===========================================================================
@@ -210,13 +233,20 @@ cat("  Touched years:   ", paste(touched_years, collapse = ", "), "\n")
 # ===========================================================================
 cat("=== 3. Pull year shards ===\n")
 
+# Days and rows of each year shard as pulled, for the check before publishing.
+published_stats <- list()
+
 for (yr in touched_years) {
   shard      <- sprintf("downloads-%04d.db", yr)
   shard_path <- file.path(out_dir, shard)
+  status     <- 0L
   if (!file.exists(shard_path)) {
-    gh_download(shard, out_dir)
+    status <- gh_download(shard, out_dir)
   }
+  # A past year missing here would be republished short, so the run stops.
+  check_shard_pulled(yr, file.exists(shard_path), as.integer(format(today, "%Y")), status)
   if (file.exists(shard_path)) {
+    published_stats[[shard]] <- shard_stats(shard_path)
     invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS yr",
                                 normalizePath(shard_path, mustWork = TRUE))))
     invisible(DBI::dbExecute(con,
@@ -236,8 +266,7 @@ for (yr in touched_years) {
 # Fetch CRAN package list once (reused by forward fetch and backfill)
 # ---------------------------------------------------------------------------
 cran_packages <- tryCatch({
-  ap <- available.packages(repos = Sys.getenv("CRAN_REPO_URL", "https://cloud.r-project.org"))
-  sort(unique(rownames(ap)))
+  cran_package_names(Sys.getenv("CRAN_REPO_URL", "https://cloud.r-project.org"))
 }, error = function(e) {
   cat("Warning: Could not get available.packages:", e$message, "\n")
   character(0)
@@ -251,6 +280,8 @@ rows_added    <- 0L
 forward_rows  <- 0L
 backfill_rows <- 0L
 repair_rows   <- 0L
+request_rows  <- 0L
+request_truncated <- FALSE
 
 # fetch_downloads() lives in helpers.R.
 
@@ -331,6 +362,27 @@ maint_deadline <- Sys.time() + MAINTENANCE_BUDGET_MIN * 60
 cat("\nBackfill + repair budget:", MAINTENANCE_BUDGET_MIN, "min (until",
     format(maint_deadline, "%H:%M:%S", tz = "UTC"), "UTC)\n")
 
+# =========================================================================
+# Requested backfill: the dispatch's packages from its start date, after the
+# forward fetch and inside the maintenance budget
+# =========================================================================
+if (!is.null(BACKFILL_REQUEST)) {
+  cat("\n=== 4a2. Requested backfill ===\n")
+  tryCatch({
+    cat("  Fetching", length(BACKFILL_REQUEST$packages), "packages from",
+        format(BACKFILL_REQUEST$start), "to", format(BACKFILL_REQUEST$end), "\n")
+    result_df <- fetch_downloads(BACKFILL_REQUEST$packages, BACKFILL_REQUEST$start,
+                                 BACKFILL_REQUEST$end, deadline = maint_deadline)
+    request_rows      <- insert_downloads(con, result_df)
+    request_truncated <- isTRUE(attr(result_df, "truncated"))
+    rows_added <- rows_added + request_rows
+    cat("  Inserted", request_rows, "rows\n")
+    if (request_truncated) cat("  Budget reached before the end; the rest was not fetched\n")
+  }, error = function(e) {
+    cat("  ERROR:", e$message, "\n")
+  })
+}
+
 cat("\n=== 4b. Backfill ===\n")
 if (!BACKFILL_ENABLED) cat("  Backfill disabled (BACKFILL_ENABLED = FALSE)\n")
 if (BACKFILL_ENABLED) tryCatch({
@@ -404,9 +456,9 @@ cat("\n=== 4c. Repair Partial Coverage ===\n")
 repair_attempted <- character(0)
 tryCatch({
   partial <- dbGetQuery(con, partial_dates_sql)
-  # Only dates in a shard this run exports can be repaired for good.
-  partial <- partial[as.integer(substr(partial$date, 1, 4)) %in% touched_years, ,
-                     drop = FALSE]
+  # Only dates in a shard this run exports can be repaired for good, and a year
+  # loaded only for a requested backfill is not repaired.
+  partial <- repair_candidates(partial, repair_years)
   ledger  <- read_repair_ledger(con)
   due     <- select_repair_dates(partial, ledger, today = Sys.Date(),
                                  retry_days = REPAIR_RETRY_DAYS,
@@ -561,12 +613,19 @@ summary_df  <- DBI::dbGetQuery(con, "SELECT * FROM downloads_summary")
 export_summary_shard(summary_out, summary_df)
 cat("  Exported downloads-summary.db (", nrow(summary_df), "rows )\n")
 
-# Export each changed year shard
+# Export each changed year shard. One that holds fewer days or rows than the
+# published shard stops the run here, before the publish step. A shard that was
+# not there to pull is compared with the release as it is now.
 for (yr in changed_years) {
   rows       <- extract_year_rows(con, yr)
   shard_name <- sprintf("downloads-%04d.db", yr)
-  export_shard(file.path(out_dir, shard_name), rows)
+  shard_out  <- file.path(out_dir, shard_name)
+  export_shard(shard_out, rows)
   cat("  Exported", shard_name, "(", nrow(rows), "rows )\n")
+  published <- published_stats[[shard_name]] %||%
+    published_shard_stats(shard_name, gh_release_assets, gh_download,
+                          file.path(out_dir, "_published"))
+  check_shard_not_shrunk(shard_name, shard_stats(shard_out), published)
 }
 
 # ===========================================================================
@@ -609,6 +668,12 @@ write_manifest(
     backfill_rows    = backfill_rows %||% 0L,
     repair_rows      = repair_rows   %||% 0L,
     repair_dates_attempted = length(repair_attempted),
+    data_through     = latest_daily_date(con),
+    backfill_request = if (is.null(BACKFILL_REQUEST)) NULL else list(
+      packages  = as.list(BACKFILL_REQUEST$packages),
+      from      = format(BACKFILL_REQUEST$start),
+      rows      = request_rows,
+      truncated = request_truncated),
     working_db_rows  = working_db_rows,
     note             = paste("working_db_rows counts rows from touched years +",
                              "recent window only; sum each year shard for the",
