@@ -51,6 +51,54 @@ check_shard_pulled <- function(year, present, current_year, status = 0L) {
   invisible(TRUE)
 }
 
+#' The distinct days and the rows in a shard file's downloads_daily.
+shard_stats <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  r <- DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT date) AS days, COUNT(*) AS n FROM downloads_daily")
+  list(days = as.integer(r$days[1]), rows = as.numeric(r$n[1]))
+}
+
+#' Stop when a year shard holds fewer days or fewer rows than the published one
+#' it would replace. `published` is NULL for a shard the release does not have.
+check_shard_not_shrunk <- function(shard, new, published) {
+  if (is.null(published)) return(invisible(TRUE))
+  if (new$days < published$days || new$rows < published$rows) {
+    stop(sprintf(paste("%s holds %d days and %.0f rows but the published shard holds",
+                       "%d days and %.0f rows; stopping before it is replaced"),
+                 shard, new$days, new$rows, published$days, published$rows),
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+#' Asset names from `gh release view --json assets --jq '.assets[].name'`. A
+#' release that does not exist yet has none; any other failure stops the run.
+release_asset_names <- function(output, status) {
+  if (status == 0L) return(output[nzchar(output)])
+  if (any(grepl("release not found", output, fixed = TRUE))) return(character(0))
+  stop("could not list the assets on the release (gh exit ", status,
+       "); stopping before a year shard is replaced unchecked", call. = FALSE)
+}
+
+#' shard_stats() of a year shard as the release holds it now, or NULL when the
+#' release does not list it. `list_assets()` returns the release's asset names;
+#' `download(shard, dir)` fetches the shard into `dir` and returns gh's exit
+#' status. The downloaded copy is removed afterwards.
+published_shard_stats <- function(shard, list_assets, download, dir) {
+  if (!(shard %in% list_assets())) return(NULL)
+  path <- file.path(dir, shard)
+  on.exit(unlink(path), add = TRUE)
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  status <- download(shard, dir)
+  if (status != 0L || !file.exists(path)) {
+    stop(shard, " is on the release but could not be downloaded (gh exit ", status,
+         "); stopping before it is replaced unchecked", call. = FALSE)
+  }
+  shard_stats(path)
+}
+
 #' A dispatch's request to fetch named packages again, from the
 #' backfill_packages and backfill_from inputs, as list(packages, start, end), or
 #' NULL when neither is set. Names split on commas or whitespace; the start is a

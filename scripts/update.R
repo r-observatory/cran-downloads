@@ -74,6 +74,17 @@ gh_download <- function(pattern, dir) {
   attr(res, "status") %||% 0L
 }
 
+# Asset names on the "current" release; stops when they cannot be listed.
+gh_release_assets <- function() {
+  res <- suppressWarnings(system2("gh",
+    c("release", "view", "current",
+      "--repo", "r-observatory/cran-downloads",
+      "--json", "assets",
+      "--jq", shQuote(".assets[].name")),
+    stdout = TRUE, stderr = TRUE))
+  release_asset_names(res, attr(res, "status") %||% 0L)
+}
+
 # ===========================================================================
 # 1. Pull downloads-recent.db from the "current" release (always needed).
 #    If the release doesn't exist yet (first run), proceed with empty state.
@@ -222,6 +233,9 @@ cat("  Touched years:   ", paste(touched_years, collapse = ", "), "\n")
 # ===========================================================================
 cat("=== 3. Pull year shards ===\n")
 
+# Days and rows of each year shard as pulled, for the check before publishing.
+published_stats <- list()
+
 for (yr in touched_years) {
   shard      <- sprintf("downloads-%04d.db", yr)
   shard_path <- file.path(out_dir, shard)
@@ -232,6 +246,7 @@ for (yr in touched_years) {
   # A past year missing here would be republished short, so the run stops.
   check_shard_pulled(yr, file.exists(shard_path), as.integer(format(today, "%Y")), status)
   if (file.exists(shard_path)) {
+    published_stats[[shard]] <- shard_stats(shard_path)
     invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS yr",
                                 normalizePath(shard_path, mustWork = TRUE))))
     invisible(DBI::dbExecute(con,
@@ -598,12 +613,19 @@ summary_df  <- DBI::dbGetQuery(con, "SELECT * FROM downloads_summary")
 export_summary_shard(summary_out, summary_df)
 cat("  Exported downloads-summary.db (", nrow(summary_df), "rows )\n")
 
-# Export each changed year shard
+# Export each changed year shard. One that holds fewer days or rows than the
+# published shard stops the run here, before the publish step. A shard that was
+# not there to pull is compared with the release as it is now.
 for (yr in changed_years) {
   rows       <- extract_year_rows(con, yr)
   shard_name <- sprintf("downloads-%04d.db", yr)
-  export_shard(file.path(out_dir, shard_name), rows)
+  shard_out  <- file.path(out_dir, shard_name)
+  export_shard(shard_out, rows)
   cat("  Exported", shard_name, "(", nrow(rows), "rows )\n")
+  published <- published_stats[[shard_name]] %||%
+    published_shard_stats(shard_name, gh_release_assets, gh_download,
+                          file.path(out_dir, "_published"))
+  check_shard_not_shrunk(shard_name, shard_stats(shard_out), published)
 }
 
 # ===========================================================================
