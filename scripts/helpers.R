@@ -114,6 +114,7 @@ parse_backfill_request <- function(packages, from, yesterday,
   }
   pkgs <- unique(strsplit(packages, "[,[:space:]]+")[[1]])
   pkgs <- pkgs[nzchar(pkgs)]
+  if (length(pkgs) == 0L) stop("backfill_packages names no package")
   bad  <- pkgs[!grepl("^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$", pkgs)]
   if (length(bad) > 0L) stop("not a CRAN package name: ", paste(bad, collapse = ", "))
   start <- as.Date(from, format = "%Y-%m-%d")

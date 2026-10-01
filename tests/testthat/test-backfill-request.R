@@ -34,6 +34,12 @@ test_that("a name that is not a CRAN package name is refused", {
                "not a CRAN package name")
 })
 
+test_that("a package list that holds only separators is refused", {
+  y <- as.Date("2026-10-01")
+  expect_error(parse_backfill_request(",", "2021-01-01", y), "names no package")
+  expect_error(parse_backfill_request(" , ,", "2021-01-01", y), "names no package")
+})
+
 test_that("a start date that is malformed or out of range is refused", {
   y <- as.Date("2026-10-01")
   expect_error(parse_backfill_request("hespdiv", "2021-1-1", y), "YYYY-MM-DD")
