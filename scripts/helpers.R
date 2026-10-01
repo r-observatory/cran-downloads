@@ -62,6 +62,13 @@ extract_recent_rows <- function(con, today, window_days) {
   )
 }
 
+#' The newest day in downloads_daily as "YYYY-MM-DD", or NA when it is empty.
+#' Published as the manifest's summary$data_through.
+latest_daily_date <- function(con) {
+  d <- DBI::dbGetQuery(con, "SELECT MAX(date) AS d FROM downloads_daily")$d[1]
+  if (is.null(d) || is.na(d) || !nzchar(d)) NA_character_ else as.character(d)
+}
+
 #' Compute the lowercase hex SHA-256 of a file's exact on-disk bytes.
 #'
 #' Uses whatever the runner already provides, in preference order:

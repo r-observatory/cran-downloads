@@ -98,7 +98,7 @@ SELECT package, total_30d, rank_30d, trend
 
 ### Manifest
 
-`manifest.json` lists which shards changed in the most recent run — useful for downstream consumers doing incremental updates.
+`manifest.json` lists which shards changed in the most recent run, which downstream consumers use for incremental updates. `summary.data_through` is the newest day the data holds, as `YYYY-MM-DD`.
 
 ```bash
 gh release download current --pattern manifest.json --repo r-observatory/cran-downloads

@@ -609,6 +609,7 @@ write_manifest(
     backfill_rows    = backfill_rows %||% 0L,
     repair_rows      = repair_rows   %||% 0L,
     repair_dates_attempted = length(repair_attempted),
+    data_through     = latest_daily_date(con),
     working_db_rows  = working_db_rows,
     note             = paste("working_db_rows counts rows from touched years +",
                              "recent window only; sum each year shard for the",
