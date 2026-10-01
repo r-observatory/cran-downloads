@@ -5,9 +5,16 @@
 #' @param forward_dates  Date vector — dates being forward-fetched (may be empty)
 #' @param backfill_range NULL or list(start=Date, end=Date) — single backfill chunk
 #' @param repair_dates   Character vector — YYYY-MM-DD strings of dates needing repair
+#' @param request        NULL or parse_backfill_request()'s list(packages, start, end)
 #' @return integer vector of years, sorted ascending, no duplicates
-compute_touched_years <- function(forward_dates, backfill_range, repair_dates) {
+compute_touched_years <- function(forward_dates, backfill_range, repair_dates,
+                                  request = NULL) {
   years <- integer(0)
+
+  if (!is.null(request)) {
+    years <- c(years, seq(as.integer(format(request$start, "%Y")),
+                          as.integer(format(request$end, "%Y"))))
+  }
 
   if (length(forward_dates) > 0) {
     years <- c(years, as.integer(format(forward_dates, "%Y")))
@@ -42,6 +49,41 @@ check_shard_pulled <- function(year, present, current_year, status = 0L) {
          "); stopping before it is republished without its rows", call. = FALSE)
   }
   invisible(TRUE)
+}
+
+#' A dispatch's request to fetch named packages again, from the
+#' backfill_packages and backfill_from inputs, as list(packages, start, end), or
+#' NULL when neither is set. Names split on commas or whitespace; the start is a
+#' YYYY-MM-DD day from the cranlogs start (2012-10-01) to `yesterday`, and the
+#' end is `yesterday`. Anything else stops the run before a download.
+parse_backfill_request <- function(packages, from, yesterday,
+                                   earliest = as.Date("2012-10-01")) {
+  packages <- trimws(if (is.null(packages)) "" else packages)
+  from     <- trimws(if (is.null(from)) "" else from)
+  if (!nzchar(packages) && !nzchar(from)) return(NULL)
+  if (!nzchar(packages) || !nzchar(from)) {
+    stop("backfill_packages and backfill_from must be given together")
+  }
+  pkgs <- unique(strsplit(packages, "[,[:space:]]+")[[1]])
+  pkgs <- pkgs[nzchar(pkgs)]
+  bad  <- pkgs[!grepl("^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$", pkgs)]
+  if (length(bad) > 0L) stop("not a CRAN package name: ", paste(bad, collapse = ", "))
+  start <- as.Date(from, format = "%Y-%m-%d")
+  if (is.na(start) || format(start, "%Y-%m-%d") != from) {
+    stop("backfill_from is not a YYYY-MM-DD date: ", from)
+  }
+  yesterday <- as.Date(yesterday)
+  if (start < earliest || start > yesterday) {
+    stop(sprintf("backfill_from must fall between %s and %s", earliest, yesterday))
+  }
+  list(packages = pkgs, start = start, end = yesterday)
+}
+
+#' The partial-coverage dates the repair pass may take: those in a year this run
+#' exports for its own reasons. A year loaded only for a requested backfill is
+#' left alone, since most of its days sit below the coverage threshold for good.
+repair_candidates <- function(partial, repair_years) {
+  partial[as.integer(substr(partial$date, 1, 4)) %in% repair_years, , drop = FALSE]
 }
 
 #' Extract all downloads_daily rows for a single year.
