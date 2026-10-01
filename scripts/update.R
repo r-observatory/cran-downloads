@@ -236,8 +236,7 @@ for (yr in touched_years) {
 # Fetch CRAN package list once (reused by forward fetch and backfill)
 # ---------------------------------------------------------------------------
 cran_packages <- tryCatch({
-  ap <- available.packages(repos = Sys.getenv("CRAN_REPO_URL", "https://cloud.r-project.org"))
-  sort(unique(rownames(ap)))
+  cran_package_names(Sys.getenv("CRAN_REPO_URL", "https://cloud.r-project.org"))
 }, error = function(e) {
   cat("Warning: Could not get available.packages:", e$message, "\n")
   character(0)

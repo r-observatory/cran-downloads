@@ -62,6 +62,14 @@ extract_recent_rows <- function(con, today, window_days) {
   )
 }
 
+#' Every package name CRAN's PACKAGES index lists, sorted. Only the duplicates
+#' filter is applied: the default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner.
+cran_package_names <- function(repos) {
+  ap <- utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+  sort(unique(rownames(ap)))
+}
+
 #' The newest day in downloads_daily as "YYYY-MM-DD", or NA when it is empty.
 #' Published as the manifest's summary$data_through.
 latest_daily_date <- function(con) {

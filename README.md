@@ -2,6 +2,8 @@
 
 Daily download counts for every CRAN package, sourced from the [cranlogs API](https://cranlogs.r-pkg.org/) (RStudio CRAN mirror logs). The pipeline runs daily, fetching new download data and gradually backfilling history to October 2012. Data is published as a set of SQLite shard files attached to a single rolling GitHub release tag (`current`).
 
+The package list is CRAN's `PACKAGES` index read with only the duplicates filter, so packages that declare `OS_type: windows`, or that need a newer R than the runner, are fetched too.
+
 ## Data Access
 
 All shards live as assets on the [`current` release](https://github.com/r-observatory/cran-downloads/releases/tag/current). Each daily run uploads only the shards that changed; the rest remain unchanged.
