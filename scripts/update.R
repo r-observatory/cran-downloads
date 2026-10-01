@@ -213,9 +213,12 @@ cat("=== 3. Pull year shards ===\n")
 for (yr in touched_years) {
   shard      <- sprintf("downloads-%04d.db", yr)
   shard_path <- file.path(out_dir, shard)
+  status     <- 0L
   if (!file.exists(shard_path)) {
-    gh_download(shard, out_dir)
+    status <- gh_download(shard, out_dir)
   }
+  # A past year missing here would be republished short, so the run stops.
+  check_shard_pulled(yr, file.exists(shard_path), as.integer(format(today, "%Y")), status)
   if (file.exists(shard_path)) {
     invisible(DBI::dbExecute(con, sprintf("ATTACH DATABASE '%s' AS yr",
                                 normalizePath(shard_path, mustWork = TRUE))))

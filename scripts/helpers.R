@@ -27,6 +27,23 @@ compute_touched_years <- function(forward_dates, backfill_range, repair_dates) {
   sort(unique(years))
 }
 
+#' Stop when a year shard the run must load did not download. Every past year is
+#' on the release, so a missing one would be republished holding only this
+#' run's rows; only the current year may be missing, on the first run that
+#' reaches it. A file left by a failed download is never loaded.
+check_shard_pulled <- function(year, present, current_year, status = 0L) {
+  shard <- sprintf("downloads-%04d.db", as.integer(year))
+  if (present && status != 0L) {
+    stop(shard, ": the download failed part way (gh exit ", status,
+         "); stopping before anything is published", call. = FALSE)
+  }
+  if (!present && year < current_year) {
+    stop(shard, " could not be downloaded (gh exit ", status,
+         "); stopping before it is republished without its rows", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
 #' Extract all downloads_daily rows for a single year.
 #'
 #' @param con  SQLite connection (working DB with downloads_daily table)
