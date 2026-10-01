@@ -116,7 +116,7 @@ gh workflow run update.yml --repo r-observatory/cran-downloads \
   -f backfill_packages="hespdiv,RDesk" -f backfill_from=2021-01-01
 ```
 
-The run fetches those packages from `backfill_from` to yesterday after the daily fetch, inside the same 45-minute maintenance budget, and republishes every year shard from `backfill_from` on. The repair pass leaves alone the years loaded only for the request. `manifest.json` records the request under `summary.backfill_request`, with the rows it added and whether the budget ran out first; if it did, the same dispatch again finishes the rest.
+The run fetches those packages from `backfill_from` to yesterday after the daily fetch, inside the 45-minute budget it shares with the repair pass, and republishes every year shard from `backfill_from` on. The repair pass leaves alone the years loaded only for the request. `manifest.json` records the request under `summary.backfill_request`, with the rows it wrote and whether the budget ran out first. A request the budget cuts off keeps the rows fetched so far but is not resumed: the same dispatch starts again from `backfill_from`.
 
 ## Example Queries
 

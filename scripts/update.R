@@ -377,7 +377,7 @@ if (!is.null(BACKFILL_REQUEST)) {
     request_truncated <- isTRUE(attr(result_df, "truncated"))
     rows_added <- rows_added + request_rows
     cat("  Inserted", request_rows, "rows\n")
-    if (request_truncated) cat("  Budget reached before the end; dispatch again to finish\n")
+    if (request_truncated) cat("  Budget reached before the end; the rest was not fetched\n")
   }, error = function(e) {
     cat("  ERROR:", e$message, "\n")
   })
